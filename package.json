@@ -1,0 +1,29 @@
+{
+  "name": "smartlistener",
+  "version": "1.0.0",
+  "description": "Smart Listener-Based Cross-Chain Communication System (Bigiotti et al. 2025)",
+  "private": true,
+  "workspaces": [
+    "listener",
+    "dashboard"
+  ],
+  "scripts": {
+    "install:all": "npm install",
+    "compile": "npx hardhat compile",
+    "test:contracts": "npx hardhat test",
+    "deploy:local": "npx hardhat run scripts/deploy.ts --network localhost",
+    "node": "npx hardhat node",
+    "demo:send": "npx hardhat run scripts/sendTransaction.ts --network localhost",
+    "listeners": "concurrently -k -n ListenerA,ListenerB,ListenerC -c cyan,magenta,yellow \"cd listener && LISTENER_ID=A npm run start\" \"cd listener && LISTENER_ID=B npm run start\" \"cd listener && LISTENER_ID=C npm run start\"",
+    "api": "cd listener && npm run api",
+    "dev": "concurrently -k -n Node,ListenersAPI,Dashboard -c blue,green,yellow \"npm run node\" \"npm run api\" \"cd dashboard && npm run dev\""
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "concurrently": "^9.0.0",
+    "hardhat": "^2.22.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.0"
+  }
+}
