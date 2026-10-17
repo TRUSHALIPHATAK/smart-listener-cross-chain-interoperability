@@ -78,7 +78,7 @@ export const RETRY_BACKOFF_MS   = optionalInt("RETRY_BACKOFF_MS", 2_000);
 
 /**
  * DATABASE_URL: postgres://user:pass@host:5432/dbname  → uses PostgreSQL
- * (unset)                                              → uses SQLite in ./data/
+ * (unset)                                              → uses SQLite via sql.js in ./data/
  */
 export const DATABASE_URL       = process.env.DATABASE_URL ?? "";
 export const SQLITE_PATH        = optional("SQLITE_PATH", path.join(__dirname, "..", "data", "smartlistener.db"));
@@ -117,7 +117,7 @@ export function printConfig() {
   console.log(`  Source RPC:         ${SOURCE_RPC_URL}`);
   console.log(`  SenderContract:     ${SENDER_CONTRACT_ADDRESS || "(not set)"}`);
   console.log(`  Destination type:   ${DESTINATION_TYPE}`);
-  console.log(`  DB:                 ${DATABASE_URL ? "PostgreSQL" : `SQLite @ ${SQLITE_PATH}`}`);
+  console.log(`  DB:                 ${DATABASE_URL ? "PostgreSQL" : `SQLite (sql.js) @ ${SQLITE_PATH}`}`);
   console.log(`  Required votes:     ${REQUIRED_VOTES}/${TOTAL_LISTENERS}`);
   console.log(`  TX timeout:         ${TX_TIMEOUT_MS}ms`);
   console.log(`  API port:           ${API_PORT}`);

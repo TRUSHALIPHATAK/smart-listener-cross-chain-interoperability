@@ -35,7 +35,7 @@ export interface CrossChainTransaction {
   payload: string;
   /** Per-sender nonce */
   nonce: string;
-  /** Block timestamp of source event */
+  /** Block timestamp of source event (milliseconds since epoch) */
   sourceTimestamp: number;
   /** Block number of source event */
   sourceBlockNumber: number;

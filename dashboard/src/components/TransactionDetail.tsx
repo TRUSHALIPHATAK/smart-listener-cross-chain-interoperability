@@ -18,67 +18,96 @@ export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
   const votes: Vote[] = tx.votes ?? [];
 
   return (
-    <div className="detail-overlay" onClick={onClose}>
-      <div className="detail-panel" onClick={(e) => e.stopPropagation()}>
-        <div className="detail-header">
+    <div className="detail-overlay" onClick={onClose} style={{
+      position: "fixed", inset: 0, background: "rgba(110, 16, 52, 0.35)",
+      zIndex: 200, display: "flex", alignItems: "flex-end", justifyContent: "center",
+    }}>
+      <div
+        className="detail-panel"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: "#fff5f8", border: "1px solid #f5c0d0",
+          borderRadius: "14px 14px 0 0", width: "100%", maxWidth: 720,
+          maxHeight: "80vh", overflowY: "auto", padding: 24, color: "#6e1034",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 20 }}>
           <div>
-            <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Transaction Detail</h2>
-            <span className="cell-mono" style={{ fontSize: 12, color: "var(--color-accent)" }}>
+            <h2 style={{ fontSize: 16, fontWeight: 700, marginBottom: 4, color: "#9b1b4a" }}>
+              Transaction Detail
+            </h2>
+            <span style={{ fontSize: 12, color: "#d63d72", fontFamily: "monospace" }}>
               {tx.txId}
             </span>
           </div>
-          <button className="detail-close" onClick={onClose}>✕</button>
+          <button
+            type="button"
+            onClick={onClose}
+            style={{
+              background: "#ffeef3", border: "1px solid #f5c0d0", borderRadius: 6,
+              color: "#9b1b4a", cursor: "pointer", padding: "6px 10px",
+            }}
+          >✕</button>
         </div>
 
-        {/* Status */}
-        <div className="detail-field">
-          <span className="detail-field-label">Status</span>
+        <div style={{ padding: "12px 0", borderBottom: "1px solid #f5c0d0" }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: "#9b4a66", textTransform: "uppercase" }}>
+            Status
+          </span>
           <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 4 }}>
             <span className={`badge badge-${tx.status}`}>
               <span className="badge-dot" />
               {tx.status}
             </span>
             {tx.errorMessage && (
-              <span style={{ fontSize: 12, color: "var(--color-danger)" }}>{tx.errorMessage}</span>
+              <span style={{ fontSize: 12, color: "#8a2048" }}>{tx.errorMessage}</span>
             )}
           </div>
         </div>
 
-        {/* Votes */}
-        <div className="detail-field">
-          <span className="detail-field-label">Listener Votes (2-of-3 required)</span>
-          <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
-            {(["A", "B", "C"] as const).map((id) => {
-              const v = votes.find((x) => x.listenerId === id);
-              return (
-                <div key={id} style={{ textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-                  <div className={`vote-bubble ${v ? (v.vote === "APPROVE" ? "approve" : "reject") : ""}`}>
-                    {id}
-                  </div>
-                  <span style={{ fontSize: 10, color: "var(--color-text-muted)", fontFamily: "var(--font-mono)" }}>
-                    {v ? v.vote.slice(0, 3) : "–"}
-                  </span>
-                </div>
-              );
-            })}
+        <div style={{ padding: "12px 0", borderBottom: "1px solid #f5c0d0" }}>
+          <span style={{ fontSize: 11, fontWeight: 600, color: "#9b4a66", textTransform: "uppercase" }}>
+            Listener Votes (2-of-3 required)
+          </span>
+          <div style={{ display: "flex", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+            {votes.length === 0 && (
+              <span style={{ color: "#9b4a66", fontSize: 12 }}>No votes yet</span>
+            )}
+            {votes.map((v) => (
+              <div key={v.listenerId} style={{
+                border: "1px solid #f5c0d0", borderRadius: 8, padding: 10,
+                background: "#ffeef3", minWidth: 100,
+              }}>
+                <div style={{ fontWeight: 700, color: "#9b1b4a" }}>Listener {v.listenerId}</div>
+                <div style={{
+                  marginTop: 4, fontWeight: 650, color: "#6e1034",
+                  textDecoration: v.vote === "REJECT" ? "underline dashed" : "none",
+                }}>{v.vote}</div>
+                {v.reason && <div style={{ fontSize: 11, color: "#9b4a66", marginTop: 4 }}>{v.reason}</div>}
+                <div style={{ fontSize: 11, color: "#9b4a66", marginTop: 4 }}>{fmt(v.votedAt)}</div>
+              </div>
+            ))}
           </div>
         </div>
 
-        {/* Fields */}
         {[
           ["Sender", tx.sender],
-          ["Destination Chain ID", tx.destinationChainId],
-          ["Destination Address", truncate(tx.destinationAddress, 64)],
-          ["Payload", truncate(tx.payload, 80)],
+          ["Destination chain", tx.destinationChainId],
+          ["Destination address", truncate(tx.destinationAddress)],
           ["Nonce", tx.nonce],
-          ["Source Block", String(tx.sourceBlockNumber)],
+          ["Payload", truncate(tx.payload, 64)],
+          ["Dest tx hash", tx.destTxHash ?? "—"],
           ["Created", fmt(tx.createdAt)],
           ["Updated", fmt(tx.updatedAt)],
-          ...(tx.destTxHash ? [["Dest Tx Hash", tx.destTxHash]] : []),
         ].map(([label, value]) => (
-          <div className="detail-field" key={label}>
-            <span className="detail-field-label">{label}</span>
-            <span className="detail-field-value">{value}</span>
+          <div key={label} style={{ padding: "12px 0", borderBottom: "1px solid #f5c0d0" }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: "#9b4a66", textTransform: "uppercase" }}>
+              {label}
+            </div>
+            <div style={{
+              fontFamily: "monospace", fontSize: 13, color: "#6e1034",
+              wordBreak: "break-all", marginTop: 4,
+            }}>{value}</div>
           </div>
         ))}
       </div>

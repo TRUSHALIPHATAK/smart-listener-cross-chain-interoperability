@@ -3,9 +3,13 @@
  *
  * Automatically uses:
  *   • PostgreSQL if DATABASE_URL is set (production)
- *   • SQLite (better-sqlite3) otherwise (development, zero-install)
+ *   • SQLite via sql.js otherwise (development, no native build tools)
  *
  * Both backends use the identical schema.
+ *
+ * sql.js is in-memory WASM SQLite. To support multiple Node processes
+ * (3 listeners + API), each mutating call acquires a short file lock,
+ * reloads from disk, runs the SQL, then persists back to disk.
  */
 
 import * as fs from "fs";
@@ -128,161 +132,328 @@ function rowToHb(row: any): ListenerHeartbeat {
   };
 }
 
-// ── SQLite Adapter ────────────────────────────────────────────────────────────
+// ── File lock helpers (cross-process, Windows-friendly) ───────────────────────
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function acquireLock(lockPath: string, timeoutMs = 5000): Promise<() => void> {
+  const start = Date.now();
+  let delay = 5;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return () => {
+        try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+      };
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw err;
+      // Stale lock recovery: if older than 10s, remove it
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > 10_000) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch { /* ignore */ }
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`Timed out acquiring DB lock: ${lockPath}`);
+      }
+      await sleep(delay);
+      delay = Math.min(delay * 2, 50);
+    }
+  }
+}
+
+// ── SQLite Adapter (sql.js) ───────────────────────────────────────────────────
 
 class SqliteAdapter implements DbAdapter {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private db: any; // better-sqlite3 Database
+  private db: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private SQL: any;
+  private dbPath: string;
+  private lockPath: string;
+  private mtimeMs = 0;
 
-  constructor(dbPath: string) {
+  private constructor(SQL: unknown, dbPath: string) {
+    this.SQL = SQL;
+    this.dbPath = dbPath;
+    this.lockPath = dbPath + ".lock";
+  }
+
+  static async create(dbPath: string): Promise<SqliteAdapter> {
     const dir = path.dirname(dbPath);
     fs.mkdirSync(dir, { recursive: true });
-    // Dynamic require so PG-only environments don't need better-sqlite3
+
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const Database = require("better-sqlite3");
-    this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.exec(SCHEMA_SQL);
+    const initSqlJs = require("sql.js");
+    // Resolve wasm relative to the sql.js main entry (exports block package.json)
+    const sqlJsEntry = require.resolve("sql.js");
+    const wasmPath = path.join(path.dirname(sqlJsEntry), "sql-wasm.wasm");
+    const SQL = await initSqlJs({
+      locateFile: () => wasmPath,
+    });
+
+    const adapter = new SqliteAdapter(SQL, dbPath);
+    const release = await acquireLock(adapter.lockPath);
+    try {
+      adapter.loadFromDisk();
+      adapter.db.exec(SCHEMA_SQL);
+      adapter.persistToDisk();
+    } finally {
+      release();
+    }
+    return adapter;
+  }
+
+  private loadFromDisk(): void {
+    if (fs.existsSync(this.dbPath)) {
+      const buffer = fs.readFileSync(this.dbPath);
+      this.db = new this.SQL.Database(buffer);
+      this.mtimeMs = fs.statSync(this.dbPath).mtimeMs;
+    } else {
+      this.db = new this.SQL.Database();
+      this.mtimeMs = 0;
+    }
+  }
+
+  private persistToDisk(): void {
+    const data = this.db.export();
+    const tmp = this.dbPath + ".tmp";
+    fs.writeFileSync(tmp, Buffer.from(data));
+    // Atomic-ish replace on Windows: unlink then rename if needed
+    try {
+      fs.renameSync(tmp, this.dbPath);
+    } catch {
+      fs.copyFileSync(tmp, this.dbPath);
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+    this.mtimeMs = fs.statSync(this.dbPath).mtimeMs;
+  }
+
+  private reloadIfStale(): void {
+    if (!fs.existsSync(this.dbPath)) return;
+    const mtime = fs.statSync(this.dbPath).mtimeMs;
+    if (mtime !== this.mtimeMs) {
+      try { this.db.close(); } catch { /* ignore */ }
+      this.loadFromDisk();
+    }
+  }
+
+  /** Run a mutating operation under lock with reload + persist */
+  private async withWrite<T>(fn: () => T): Promise<T> {
+    const release = await acquireLock(this.lockPath);
+    try {
+      this.reloadIfStale();
+      const result = fn();
+      this.persistToDisk();
+      return result;
+    } finally {
+      release();
+    }
+  }
+
+  /** Run a read under lock with reload (ensures fresh data) */
+  private async withRead<T>(fn: () => T): Promise<T> {
+    const release = await acquireLock(this.lockPath);
+    try {
+      this.reloadIfStale();
+      return fn();
+    } finally {
+      release();
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private queryAll(sql: string, params: unknown[] = []): any[] {
+    const stmt = this.db.prepare(sql);
+    stmt.bind(params);
+    const rows: Record<string, unknown>[] = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject());
+    }
+    stmt.free();
+    return rows;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private queryOne(sql: string, params: unknown[] = []): any | null {
+    const rows = this.queryAll(sql, params);
+    return rows[0] ?? null;
+  }
+
+  private run(sql: string, params: unknown[] = []): void {
+    this.db.run(sql, params);
   }
 
   async upsertTransaction(tx: CrossChainTransaction): Promise<void> {
-    this.db.prepare(`
-      INSERT OR IGNORE INTO transactions
-        (tx_id, sender, destination_chain_id, destination_address, payload, nonce,
-         source_timestamp, source_block_number, status, created_at, updated_at,
-         approve_votes, reject_votes)
-      VALUES
-        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      tx.txId, tx.sender, tx.destinationChainId, tx.destinationAddress,
-      tx.payload, tx.nonce, tx.sourceTimestamp, tx.sourceBlockNumber,
-      tx.status, tx.createdAt, tx.updatedAt, tx.approveVotes, tx.rejectVotes
-    );
+    await this.withWrite(() => {
+      this.run(`
+        INSERT OR IGNORE INTO transactions
+          (tx_id, sender, destination_chain_id, destination_address, payload, nonce,
+           source_timestamp, source_block_number, status, created_at, updated_at,
+           approve_votes, reject_votes)
+        VALUES
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        tx.txId, tx.sender, tx.destinationChainId, tx.destinationAddress,
+        tx.payload, tx.nonce, tx.sourceTimestamp, tx.sourceBlockNumber,
+        tx.status, tx.createdAt, tx.updatedAt, tx.approveVotes, tx.rejectVotes,
+      ]);
+    });
   }
 
   async getTransaction(txId: string): Promise<CrossChainTransaction | null> {
-    const row = this.db.prepare("SELECT * FROM transactions WHERE tx_id = ?").get(txId);
-    return row ? rowToTx(row) : null;
+    return this.withRead(() => {
+      const row = this.queryOne("SELECT * FROM transactions WHERE tx_id = ?", [txId]);
+      return row ? rowToTx(row) : null;
+    });
   }
 
   async updateTransactionStatus(txId: string, status: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<void> {
-    const now = Date.now();
-    this.db.prepare(`
-      UPDATE transactions SET
-        status = ?,
-        updated_at = ?,
-        dest_tx_hash  = COALESCE(?, dest_tx_hash),
-        error_message = COALESCE(?, error_message),
-        approve_votes = COALESCE(?, approve_votes),
-        reject_votes  = COALESCE(?, reject_votes)
-      WHERE tx_id = ?
-    `).run(
-      status, now,
-      extra?.destTxHash ?? null,
-      extra?.errorMessage ?? null,
-      extra?.approveVotes ?? null,
-      extra?.rejectVotes ?? null,
-      txId
-    );
+    await this.withWrite(() => {
+      const now = Date.now();
+      this.run(`
+        UPDATE transactions SET
+          status = ?,
+          updated_at = ?,
+          dest_tx_hash  = COALESCE(?, dest_tx_hash),
+          error_message = COALESCE(?, error_message),
+          approve_votes = COALESCE(?, approve_votes),
+          reject_votes  = COALESCE(?, reject_votes)
+        WHERE tx_id = ?
+      `, [
+        status, now,
+        extra?.destTxHash ?? null,
+        extra?.errorMessage ?? null,
+        extra?.approveVotes ?? null,
+        extra?.rejectVotes ?? null,
+        txId,
+      ]);
+    });
   }
 
   async listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]> {
-    let sql = "SELECT * FROM transactions";
-    const params: (string | number)[] = [];
-    if (opts?.status) { sql += " WHERE status = ?"; params.push(opts.status); }
-    sql += " ORDER BY created_at DESC";
-    if (opts?.limit)  { sql += " LIMIT ?";  params.push(opts.limit); }
-    if (opts?.offset) { sql += " OFFSET ?"; params.push(opts.offset); }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.db.prepare(sql).all(...params) as any[]).map(rowToTx);
+    return this.withRead(() => {
+      let sql = "SELECT * FROM transactions";
+      const params: (string | number)[] = [];
+      if (opts?.status) { sql += " WHERE status = ?"; params.push(opts.status); }
+      sql += " ORDER BY created_at DESC";
+      if (opts?.limit)  { sql += " LIMIT ?";  params.push(opts.limit); }
+      if (opts?.offset) { sql += " OFFSET ?"; params.push(opts.offset); }
+      return this.queryAll(sql, params).map(rowToTx);
+    });
   }
 
   async countTransactions(status?: TxStatus): Promise<number> {
-    if (status) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return (this.db.prepare("SELECT COUNT(*) as c FROM transactions WHERE status = ?").get(status) as any).c;
-    }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.db.prepare("SELECT COUNT(*) as c FROM transactions").get() as any).c;
+    return this.withRead(() => {
+      if (status) {
+        const row = this.queryOne("SELECT COUNT(*) as c FROM transactions WHERE status = ?", [status]);
+        return Number(row?.c ?? 0);
+      }
+      const row = this.queryOne("SELECT COUNT(*) as c FROM transactions");
+      return Number(row?.c ?? 0);
+    });
   }
 
   async recordVote(vote: ListenerVote): Promise<void> {
-    this.db.prepare(`
-      INSERT OR REPLACE INTO votes (tx_id, listener_id, vote, reason, voted_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(vote.txId, vote.listenerId, vote.vote, vote.reason ?? null, vote.votedAt);
+    await this.withWrite(() => {
+      this.run(`
+        INSERT OR REPLACE INTO votes (tx_id, listener_id, vote, reason, voted_at)
+        VALUES (?, ?, ?, ?, ?)
+      `, [vote.txId, vote.listenerId, vote.vote, vote.reason ?? null, vote.votedAt]);
 
-    // Update aggregate vote counts on transaction
-    const agg = this.db.prepare(`
-      SELECT
-        SUM(CASE WHEN vote = 'APPROVE' THEN 1 ELSE 0 END) as approves,
-        SUM(CASE WHEN vote = 'REJECT'  THEN 1 ELSE 0 END) as rejects
-      FROM votes WHERE tx_id = ?
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    `).get(vote.txId) as any;
+      const agg = this.queryOne(`
+        SELECT
+          SUM(CASE WHEN vote = 'APPROVE' THEN 1 ELSE 0 END) as approves,
+          SUM(CASE WHEN vote = 'REJECT'  THEN 1 ELSE 0 END) as rejects
+        FROM votes WHERE tx_id = ?
+      `, [vote.txId]);
 
-    this.db.prepare(`
-      UPDATE transactions SET approve_votes = ?, reject_votes = ?, updated_at = ? WHERE tx_id = ?
-    `).run(agg.approves ?? 0, agg.rejects ?? 0, Date.now(), vote.txId);
+      this.run(`
+        UPDATE transactions SET approve_votes = ?, reject_votes = ?, updated_at = ? WHERE tx_id = ?
+      `, [agg?.approves ?? 0, agg?.rejects ?? 0, Date.now(), vote.txId]);
+    });
   }
 
   async getVotes(txId: string): Promise<ListenerVote[]> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.db.prepare("SELECT * FROM votes WHERE tx_id = ?").all(txId) as any[]).map(rowToVote);
+    return this.withRead(() => {
+      return this.queryAll("SELECT * FROM votes WHERE tx_id = ?", [txId]).map(rowToVote);
+    });
   }
 
   async hasVoted(txId: string, listenerId: ListenerId): Promise<boolean> {
-    const row = this.db.prepare("SELECT 1 FROM votes WHERE tx_id = ? AND listener_id = ?").get(txId, listenerId);
-    return !!row;
+    return this.withRead(() => {
+      const row = this.queryOne(
+        "SELECT 1 as present FROM votes WHERE tx_id = ? AND listener_id = ?",
+        [txId, listenerId]
+      );
+      return !!row;
+    });
   }
 
   async upsertHeartbeat(hb: ListenerHeartbeat): Promise<void> {
-    this.db.prepare(`
-      INSERT OR REPLACE INTO listener_heartbeats
-        (listener_id, last_seen_at, source_chain_connected, last_processed_block, pending_votes)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(hb.listenerId, hb.lastSeenAt, hb.sourceChainConnected ? 1 : 0, hb.lastProcessedBlock, hb.pendingVotes);
+    await this.withWrite(() => {
+      this.run(`
+        INSERT OR REPLACE INTO listener_heartbeats
+          (listener_id, last_seen_at, source_chain_connected, last_processed_block, pending_votes)
+        VALUES (?, ?, ?, ?, ?)
+      `, [hb.listenerId, hb.lastSeenAt, hb.sourceChainConnected ? 1 : 0, hb.lastProcessedBlock, hb.pendingVotes]);
+    });
   }
 
   async getHeartbeats(): Promise<ListenerHeartbeat[]> {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.db.prepare("SELECT * FROM listener_heartbeats").all() as any[]).map(rowToHb);
+    return this.withRead(() => {
+      return this.queryAll("SELECT * FROM listener_heartbeats").map(rowToHb);
+    });
   }
 
   async getTimedOutTransactions(cutoffMs: number): Promise<CrossChainTransaction[]> {
-    const cutoff = Date.now() - cutoffMs;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (this.db.prepare(`
-      SELECT * FROM transactions
-      WHERE status IN ('PENDING', 'VOTED', 'APPROVED', 'EXECUTING')
-        AND created_at < ?
-    `).all(cutoff) as any[]).map(rowToTx);
+    return this.withRead(() => {
+      const cutoff = Date.now() - cutoffMs;
+      return this.queryAll(`
+        SELECT * FROM transactions
+        WHERE status IN ('PENDING', 'VOTED', 'APPROVED', 'EXECUTING')
+          AND created_at < ?
+      `, [cutoff]).map(rowToTx);
+    });
   }
 
   async getAvgLatencyMs(_windowMs: number): Promise<number> {
-    // Approximate latency as updated_at - created_at for EXECUTED txns
-    const cutoff = Date.now() - _windowMs;
-    const row = this.db.prepare(`
-      SELECT AVG(updated_at - created_at) as avg_latency
-      FROM transactions
-      WHERE status = 'EXECUTED' AND updated_at > ?
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    `).get(cutoff) as any;
-    return row?.avg_latency ?? 0;
+    return this.withRead(() => {
+      const cutoff = Date.now() - _windowMs;
+      const row = this.queryOne(`
+        SELECT AVG(updated_at - created_at) as avg_latency
+        FROM transactions
+        WHERE status = 'EXECUTED' AND updated_at > ?
+      `, [cutoff]);
+      return Number(row?.avg_latency ?? 0);
+    });
   }
 
   async getThroughput(windowMs: number): Promise<number> {
-    const cutoff = Date.now() - windowMs;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const row = this.db.prepare(`
-      SELECT COUNT(*) as cnt FROM transactions
-      WHERE status = 'EXECUTED' AND updated_at > ?
-    `).get(cutoff) as any;
-    return row?.cnt ?? 0;
+    return this.withRead(() => {
+      const cutoff = Date.now() - windowMs;
+      const row = this.queryOne(`
+        SELECT COUNT(*) as cnt FROM transactions
+        WHERE status = 'EXECUTED' AND updated_at > ?
+      `, [cutoff]);
+      return Number(row?.cnt ?? 0);
+    });
   }
 
   async close(): Promise<void> {
-    this.db.close();
+    try {
+      this.persistToDisk();
+    } catch { /* ignore */ }
+    try {
+      this.db.close();
+    } catch { /* ignore */ }
   }
 }
 
@@ -299,13 +470,6 @@ class PostgresAdapter implements DbAdapter {
   }
 
   async initialize(): Promise<void> {
-    // Replace SQLite-specific syntax for PG
-    const pgSchema = SCHEMA_SQL
-      .replace(/INSERT OR IGNORE/g, "INSERT OR IGNORE".replace("OR IGNORE", ""))
-      .replace(/INTEGER/g, "BIGINT")
-      .replace(/TEXT PRIMARY KEY/g, "TEXT PRIMARY KEY");
-    
-    // Use standard PG DDL
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS transactions (
         tx_id                TEXT PRIMARY KEY,
@@ -343,7 +507,6 @@ class PostgresAdapter implements DbAdapter {
       CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at);
       CREATE INDEX IF NOT EXISTS idx_votes_tx_id             ON votes(tx_id);
     `);
-    void pgSchema; // suppress unused warning
   }
 
   async upsertTransaction(tx: CrossChainTransaction): Promise<void> {
@@ -486,8 +649,8 @@ export async function getDb(): Promise<DbAdapter> {
     await adapter.initialize();
     _db = adapter;
   } else {
-    console.log("[db] Using SQLite:", SQLITE_PATH);
-    _db = new SqliteAdapter(SQLITE_PATH);
+    console.log("[db] Using SQLite (sql.js):", SQLITE_PATH);
+    _db = await SqliteAdapter.create(SQLITE_PATH);
   }
 
   return _db;

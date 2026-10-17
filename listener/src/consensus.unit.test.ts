@@ -2,8 +2,8 @@
  * Unit tests for consensus.ts — pure function, no mocks needed
  */
 
-import { evaluateConsensus, validateVote } from "../consensus";
-import { ListenerVote } from "../types";
+import { evaluateConsensus, validateVote } from "./consensus";
+import { ListenerVote } from "./types";
 
 const makeVote = (listenerId: "A" | "B" | "C", vote: "APPROVE" | "REJECT"): ListenerVote => ({
   txId: "0xabc",

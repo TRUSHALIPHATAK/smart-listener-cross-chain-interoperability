@@ -70,9 +70,15 @@ app.get("/api/transactions", async (req: Request, res: Response) => {
 app.get("/api/transactions/:txId", async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const tx = await db.getTransaction(req.params.txId);
-    if (!tx) { res.status(404).json({ error: "Transaction not found" }); return; }
-    const votes = await db.getVotes(req.params.txId);
+    const txId = req.params.txId;
+    if (typeof txId !== "string") {
+      return res.status(400).json({ error: "Invalid transaction ID" });
+    }
+    const tx = await db.getTransaction(txId);
+    if (!tx) {
+      return res.status(404).json({ error: "Transaction not found" });
+    }
+    const votes = await db.getVotes(txId);
     res.json({ ...tx, votes });
   } catch (err) {
     log.error({ err }, "GET /api/transactions/:txId error");

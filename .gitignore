@@ -6,3 +6,10 @@ artifacts/
 cache/
 coverage/
 dist/
+logs/
+listener/data/
+*.db
+*.db-journal
+*.db.lock
+*.db.tmp
+typechain-types/

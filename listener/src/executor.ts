@@ -9,8 +9,8 @@
  *   - Structured logging of all state transitions
  */
 
-import { CrossChainTransaction, DestinationResult } from "../types";
-import { DbAdapter } from "../db";
+import { CrossChainTransaction, DestinationResult } from "./types";
+import { DbAdapter } from "./db";
 import { simulatedExecute } from "./destinationAdapter/simulatedAdapter";
 import { fabricExecute } from "./destinationAdapter/fabricAdapter";
 import { childLogger } from "./logger";

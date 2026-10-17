@@ -97,7 +97,8 @@ async function main() {
       destinationAddress:  event.destinationAddress,
       payload:             event.payload,
       nonce:               event.nonce.toString(),
-      sourceTimestamp:     Number(event.timestamp),
+      // Contract emits seconds; store milliseconds for consistent UI/API timestamps
+      sourceTimestamp:     Number(event.timestamp) * 1000,
       sourceBlockNumber:   event.blockNumber,
       status:              "PENDING",
       createdAt:           Date.now(),
