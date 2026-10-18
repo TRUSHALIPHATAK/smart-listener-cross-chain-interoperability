@@ -18,7 +18,8 @@ export type TxStatus =
   | "TIMED_OUT"
   | "REJECTED";
 
-export type ListenerId = "A" | "B" | "C";
+export const LISTENER_IDS = ["A", "B", "C", "D"] as const;
+export type ListenerId = (typeof LISTENER_IDS)[number];
 
 export type VoteValue = "APPROVE" | "REJECT";
 

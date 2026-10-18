@@ -1,6 +1,7 @@
 import * as dotenv from "dotenv";
 import * as path from "path";
 import * as fs from "fs";
+import { LISTENER_IDS, ListenerId } from "./types";
 
 dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
 
@@ -27,16 +28,18 @@ function optionalInt(key: string, fallback: number): number {
 // ── Listener Identity ─────────────────────────────────────────────────────────
 
 const rawId = optional("LISTENER_ID", "A").toUpperCase();
-if (!["A", "B", "C"].includes(rawId)) {
-  throw new Error(`LISTENER_ID must be A, B, or C. Got: ${rawId}`);
+if (!(LISTENER_IDS as readonly string[]).includes(rawId)) {
+  throw new Error(`LISTENER_ID must be one of ${LISTENER_IDS.join(", ")}. Got: ${rawId}`);
 }
-export const LISTENER_ID = rawId as "A" | "B" | "C";
+export const LISTENER_ID = rawId as ListenerId;
 
 // ── Source Chain ──────────────────────────────────────────────────────────────
 
 export const SOURCE_RPC_URL     = optional("SOURCE_RPC_URL", "http://127.0.0.1:8545");
 export const SOURCE_CHAIN_ID    = optionalInt("SOURCE_CHAIN_ID", 31337);
 export const POLL_INTERVAL_MS   = optionalInt("POLL_INTERVAL_MS", 2000);
+/** First block to scan on startup (0 = replay from genesis; safe because votes are idempotent) */
+export const START_BLOCK        = optionalInt("START_BLOCK", 0);
 export const CONFIRMATIONS      = optionalInt("CONFIRMATIONS", 1);
 
 // ── Contract Addresses ────────────────────────────────────────────────────────
@@ -61,9 +64,17 @@ export const RECEIVER_MOCK_ADDRESS   = process.env.RECEIVER_MOCK_ADDRESS   ?? de
 // ── Consensus ─────────────────────────────────────────────────────────────────
 
 /** Minimum approve votes needed to trigger execution */
-export const REQUIRED_VOTES     = optionalInt("REQUIRED_VOTES", 2);
+export const REQUIRED_VOTES     = optionalInt("REQUIRED_VOTES", 3);
 /** Total number of Listener processes */
-export const TOTAL_LISTENERS    = optionalInt("TOTAL_LISTENERS", 3);
+export const TOTAL_LISTENERS    = optionalInt("TOTAL_LISTENERS", 4);
+
+// Paper (Bigiotti et al.) requires the signing threshold t >= n/2 + 1 (strict majority).
+if (TOTAL_LISTENERS > LISTENER_IDS.length) {
+  throw new Error(`TOTAL_LISTENERS (${TOTAL_LISTENERS}) exceeds supported listener IDs (${LISTENER_IDS.length})`);
+}
+if (REQUIRED_VOTES <= TOTAL_LISTENERS / 2 || REQUIRED_VOTES > TOTAL_LISTENERS) {
+  throw new Error(`REQUIRED_VOTES (${REQUIRED_VOTES}) must be a strict majority of TOTAL_LISTENERS (${TOTAL_LISTENERS})`);
+}
 
 // ── Timing ────────────────────────────────────────────────────────────────────
 
@@ -102,7 +113,7 @@ export const FABRIC_GATEWAY_URL = optional("FABRIC_GATEWAY_URL", "");
 // ── API Server ────────────────────────────────────────────────────────────────
 
 export const API_PORT           = optionalInt("API_PORT", 3001);
-export const API_HOST           = optional("API_HOST", "0.0.0.0");
+export const API_HOST           = optional("API_HOST", "127.0.0.1");
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 

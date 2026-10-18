@@ -91,4 +91,23 @@ describe("SqliteAdapter (sql.js)", () => {
     expect(tx?.status).toBe("EXECUTED");
     expect(tx?.destTxHash).toBe("0xSIM");
   });
+
+  it("transitionStatus only succeeds once (atomic claim) and respects `from`", async () => {
+    await db.upsertTransaction({
+      txId: "0xclaim", sender: "0xS", destinationChainId: "0xd", destinationAddress: "0xa",
+      payload: "0x01", nonce: "1", sourceTimestamp: 1, sourceBlockNumber: 1,
+      status: "PENDING", createdAt: Date.now(), updatedAt: Date.now(), approveVotes: 0, rejectVotes: 0,
+    });
+    const first  = await db.transitionStatus("0xclaim", ["PENDING", "VOTED"], "APPROVED");
+    const second = await db.transitionStatus("0xclaim", ["PENDING", "VOTED"], "APPROVED");
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+    // a late TIMED_OUT must not overwrite a different state
+    expect(await db.transitionStatus("0xclaim", ["PENDING"], "TIMED_OUT")).toBe(false);
+    expect((await db.getTransaction("0xclaim"))?.status).toBe("APPROVED");
+  });
+
+  it("reports the latest updated_at", async () => {
+    expect(await db.getLastUpdatedAt()).toBeGreaterThan(0);
+  });
 });

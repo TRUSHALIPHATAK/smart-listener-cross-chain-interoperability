@@ -5,7 +5,7 @@
 import { evaluateConsensus, validateVote } from "./consensus";
 import { ListenerVote } from "./types";
 
-const makeVote = (listenerId: "A" | "B" | "C", vote: "APPROVE" | "REJECT"): ListenerVote => ({
+const makeVote = (listenerId: "A" | "B" | "C" | "D", vote: "APPROVE" | "REJECT"): ListenerVote => ({
   txId: "0xabc",
   listenerId,
   vote,
@@ -92,7 +92,7 @@ describe("validateVote", () => {
   });
 
   it("returns error for invalid listener ID", () => {
-    expect(validateVote("0xabc", "D", "APPROVE", votes)).toMatch(/Invalid listenerId/);
+    expect(validateVote("0xabc", "E", "APPROVE", votes)).toMatch(/Invalid listenerId/);
   });
 
   it("returns error for invalid vote value", () => {
@@ -102,5 +102,33 @@ describe("validateVote", () => {
 
   it("returns error for empty txId", () => {
     expect(validateVote("", "B", "APPROVE", votes)).toMatch(/Invalid txId/);
+  });
+});
+
+
+describe("evaluateConsensus — 3-of-4 (majority of four listeners)", () => {
+  const cfg = { requiredVotes: 3, totalListeners: 4 };
+
+  it("is undecided with 2 approvals and 1 vote outstanding", () => {
+    const r = evaluateConsensus([makeVote("A", "APPROVE"), makeVote("B", "APPROVE")], cfg);
+    expect(r.approved).toBe(false);
+    expect(r.rejected).toBe(false);
+    expect(r.decided).toBe(false);
+  });
+
+  it("approves at exactly 3 approvals", () => {
+    const r = evaluateConsensus([makeVote("A", "APPROVE"), makeVote("B", "APPROVE"), makeVote("D", "APPROVE")], cfg);
+    expect(r.approved).toBe(true);
+  });
+
+  it("rejects as soon as 2 rejects make 3 approvals impossible", () => {
+    const r = evaluateConsensus([makeVote("A", "REJECT"), makeVote("C", "REJECT")], cfg);
+    expect(r.rejected).toBe(true);
+    expect(r.approved).toBe(false);
+  });
+
+  it("accepts listener D as a valid voter", () => {
+    expect(validateVote("0xabc", "D", "APPROVE", [])).toBeNull();
+    expect(validateVote("0xabc", "E", "APPROVE", [])).not.toBeNull();
   });
 });

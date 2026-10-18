@@ -67,7 +67,7 @@ export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
 
         <div style={{ padding: "12px 0", borderBottom: "1px solid #f5c0d0" }}>
           <span style={{ fontSize: 11, fontWeight: 600, color: "#9b4a66", textTransform: "uppercase" }}>
-            Listener Votes (2-of-3 required)
+            Listener Votes (3-of-4 required)
           </span>
           <div style={{ display: "flex", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
             {votes.length === 0 && (

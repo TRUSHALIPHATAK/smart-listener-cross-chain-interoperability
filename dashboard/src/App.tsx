@@ -204,7 +204,7 @@ export default function App() {
     setSubmittedHash("");
 
     try {
-      const response = await fetch("/api/transactions", {
+      const response = await fetch("/api/transactions/submit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ destinationAddress, payload }),
@@ -249,6 +249,7 @@ export default function App() {
         ["Executed", metrics.executed],
         ["Failed", metrics.failed],
         ["Rejected", metrics.rejected],
+        ["Timed out", metrics.timedOut],
         ["Average latency", `${metrics.avgLatencyMs} ms`],
         ["Throughput", `${metrics.throughputPerMinute}/min`],
       ]
@@ -496,8 +497,8 @@ export default function App() {
                 <Panel title="What happens next">
                   <ol className="workflow-list">
                     <li>The source contract emits a transaction event.</li>
-                    <li>Three independent listeners validate the event and cast votes.</li>
-                    <li>Two matching approval votes are required for approval.</li>
+                    <li>Four independent listeners validate the event and cast votes.</li>
+                    <li>Three matching approval votes (a strict majority of four) are required.</li>
                     <li>The destination adapter processes an approved transaction.</li>
                   </ol>
                   <p className="form-hint" style={{ marginTop: 16 }}>
@@ -512,7 +513,7 @@ export default function App() {
 
       <footer className="footer">
         <span>
-          Smart Listener · Bigiotti et al. (2025) · Optimistic 2-of-3 Inter-Blockchain Protocol
+          Smart Listener · Bigiotti et al. (2025) · Majority-vote variant of the Smart Listeners protocol
         </span>
         <span className="footer-note">
           Simulated destination · No cross-chain atomicity guarantee

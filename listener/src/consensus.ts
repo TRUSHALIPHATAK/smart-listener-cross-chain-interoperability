@@ -6,7 +6,7 @@
  * Listener approvals are independent votes.
  */
 
-import { ListenerVote, VoteValue } from "./types";
+import { LISTENER_IDS, ListenerVote, VoteValue } from "./types";
 
 export interface ConsensusResult {
   approved: boolean;
@@ -59,7 +59,7 @@ export function validateVote(
   existingVotes: ListenerVote[]
 ): string | null {
   if (!txId || typeof txId !== "string") return "Invalid txId";
-  if (!["A", "B", "C"].includes(listenerId)) return `Invalid listenerId: ${listenerId}`;
+  if (!(LISTENER_IDS as readonly string[]).includes(listenerId)) return `Invalid listenerId: ${listenerId}`;
   if (!["APPROVE", "REJECT"].includes(vote)) return `Invalid vote value: ${vote}`;
 
   const alreadyVoted = existingVotes.some((v) => v.listenerId === listenerId);

@@ -4,7 +4,7 @@
   Starts the Smart Listener local demo stack on Windows PowerShell.
 
 .DESCRIPTION
-  Launches Hardhat node, deploys contracts, API server, three listeners (A/B/C),
+  Launches Hardhat node, deploys contracts, API server, four listeners (A/B/C/D),
   and the Vite dashboard. Errors are printed clearly. Press Ctrl+C to stop all.
 
 .NOTES
@@ -176,8 +176,9 @@ try {
   Start-LoggedJob "listener-A" $listenerDir "set LISTENER_ID=A&& npx ts-node src/listenerProcess.ts"
   Start-LoggedJob "listener-B" $listenerDir "set LISTENER_ID=B&& npx ts-node src/listenerProcess.ts"
   Start-LoggedJob "listener-C" $listenerDir "set LISTENER_ID=C&& npx ts-node src/listenerProcess.ts"
+  Start-LoggedJob "listener-D" $listenerDir "set LISTENER_ID=D&& npx ts-node src/listenerProcess.ts"
   Start-Sleep -Seconds 3
-  Write-Ok "Listeners A/B/C launched (check logs/listener-*.out.log)"
+  Write-Ok "Listeners A/B/C/D launched (check logs/listener-*.out.log)"
 
   # ── Dashboard ──────────────────────────────────────────────────────────────
   $dashboardDir = Join-Path $Root "dashboard"

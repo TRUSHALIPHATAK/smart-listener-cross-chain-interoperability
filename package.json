@@ -14,7 +14,7 @@
     "deploy:local": "npx hardhat run scripts/deploy.ts --network localhost",
     "node": "npx hardhat node",
     "demo:send": "npx hardhat run scripts/sendTransaction.ts --network localhost",
-    "listeners": "concurrently -k -n ListenerA,ListenerB,ListenerC -c magenta,darkMagenta,pink \"cd listener && npx cross-env LISTENER_ID=A npm run start\" \"cd listener && npx cross-env LISTENER_ID=B npm run start\" \"cd listener && npx cross-env LISTENER_ID=C npm run start\"",
+    "listeners": "concurrently -k -n ListenerA,ListenerB,ListenerC,ListenerD -c magenta,darkMagenta,pink,red \"cd listener && npx cross-env LISTENER_ID=A npm run start\" \"cd listener && npx cross-env LISTENER_ID=B npm run start\" \"cd listener && npx cross-env LISTENER_ID=C npm run start\" \"cd listener && npx cross-env LISTENER_ID=D npm run start\"",
     "api": "cd listener && npm run api",
     "start:all": "powershell -ExecutionPolicy Bypass -File ./start-all.ps1",
     "dev": "concurrently -k -n Node,API,Dashboard -c magenta,darkMagenta,pink \"npm run node\" \"npm run api\" \"cd dashboard && npm run dev\""

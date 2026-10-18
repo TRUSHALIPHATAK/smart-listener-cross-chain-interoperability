@@ -30,23 +30,12 @@ export async function executeTransaction(
   tx: CrossChainTransaction,
   db: DbAdapter
 ): Promise<void> {
-  // ── Idempotency guard ──────────────────────────────────────────────────────
-  const current = await db.getTransaction(tx.txId);
-  if (!current) {
-    log.error({ txId: tx.txId }, "Transaction not found in DB — cannot execute");
+  // ── Atomic claim: only one executor may move APPROVED -> EXECUTING ─────────
+  const claimed = await db.transitionStatus(tx.txId, ["APPROVED"], "EXECUTING");
+  if (!claimed) {
+    log.warn({ txId: tx.txId }, "Could not claim transaction (not APPROVED any more) — skipping duplicate execution");
     return;
   }
-  if (current.status === "EXECUTED") {
-    log.warn({ txId: tx.txId }, "Transaction already EXECUTED — skipping (duplicate prevention)");
-    return;
-  }
-  if (current.status === "FAILED" || current.status === "TIMED_OUT" || current.status === "REJECTED") {
-    log.warn({ txId: tx.txId, status: current.status }, "Transaction in terminal state — skipping");
-    return;
-  }
-
-  // ── Mark EXECUTING ─────────────────────────────────────────────────────────
-  await db.updateTransactionStatus(tx.txId, "EXECUTING");
   log.info({ txId: tx.txId, destination: DESTINATION_TYPE }, "Beginning execution");
 
   // ── Select destination adapter ─────────────────────────────────────────────
@@ -73,15 +62,16 @@ export async function executeTransaction(
 
   // ── Update final state ─────────────────────────────────────────────────────
   if (lastResult.success) {
-    await db.updateTransactionStatus(tx.txId, "EXECUTED", {
+    const ok = await db.transitionStatus(tx.txId, ["EXECUTING"], "EXECUTED", {
       destTxHash: lastResult.destTxHash,
     });
+    if (!ok) log.warn({ txId: tx.txId }, "Executed on destination but status was changed meanwhile (e.g. timed out)");
     log.info(
       { txId: tx.txId, destTxHash: lastResult.destTxHash, latencyMs: lastResult.latencyMs },
       "Transaction EXECUTED successfully"
     );
   } else {
-    await db.updateTransactionStatus(tx.txId, "FAILED", {
+    await db.transitionStatus(tx.txId, ["EXECUTING"], "FAILED", {
       errorMessage: lastResult.errorMessage ?? "Unknown error after all retries",
     });
     log.error(

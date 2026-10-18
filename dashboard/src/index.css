@@ -1335,3 +1335,7 @@ textarea::placeholder {
   .step-card:nth-child(5) { grid-column: auto; }
   .arch-box { flex-basis: 100%; max-width: none; }
 }
+
+/* ---------- Step 0: 4 listeners + 9 metric cards ---------- */
+.listener-grid { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+.metrics-grid  { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }

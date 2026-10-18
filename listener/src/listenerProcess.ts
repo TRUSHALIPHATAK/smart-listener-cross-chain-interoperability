@@ -1,13 +1,13 @@
 /**
  * listenerProcess.ts — Main entry point for each Smart Listener process
  *
- * Run three instances with different LISTENER_ID env vars (A, B, C).
+ * Run four instances with different LISTENER_ID env vars (A, B, C, D).
  * Each instance independently:
  *   1. Connects to the source EVM chain
  *   2. Monitors TransactionSent events
  *   3. Validates each transaction
  *   4. Records a vote in the shared DB
- *   5. If 2-of-3 threshold is met AND this listener is elected coordinator,
+ *   5. If the majority threshold (default 3-of-4) is met AND this listener wins the atomic APPROVED claim,
  *      triggers the executor
  *   6. Runs timeout sweeper on a schedule
  *   7. Emits heartbeat to DB
@@ -133,7 +133,7 @@ async function main() {
 
     // 4. Check for duplicate/already-executed
     const existing = await db.getTransaction(txId);
-    if (existing && ["EXECUTED", "FAILED", "REJECTED"].includes(existing.status)) {
+    if (existing && ["EXECUTED", "FAILED", "REJECTED", "TIMED_OUT"].includes(existing.status)) {
       log.debug({ txId, status: existing.status }, "Transaction in terminal state — skipping vote");
       return;
     }
@@ -165,55 +165,42 @@ async function main() {
     log.info({ txId, ...consensus }, "Consensus state");
 
     if (consensus.rejected) {
-      await db.updateTransactionStatus(txId, "REJECTED", { errorMessage: "Insufficient approval votes" });
-      log.warn({ txId }, "Transaction REJECTED by consensus");
+      const changed = await db.transitionStatus(txId, ["PENDING", "VOTED"], "REJECTED", {
+        errorMessage: "Insufficient approval votes",
+      });
+      if (changed) log.warn({ txId }, "Transaction REJECTED by consensus");
       return;
     }
 
     if (consensus.approved) {
-      const currentTx = await db.getTransaction(txId);
-      if (!currentTx) return;
-
-      // Only update to APPROVED if not already executing/executed
-      if (currentTx.status === "PENDING" || currentTx.status === "VOTED") {
-        await db.updateTransactionStatus(txId, "APPROVED");
-        log.info({ txId }, "Transaction APPROVED — triggering execution");
-
-        // Coordinator election: only the Listener that casts the deciding vote executes.
-        // This prevents triple-execution while still recovering if the coordinator crashes.
-        const isDecidingVoter = vote.vote === "APPROVE" &&
-          consensus.approveCount === REQUIRED_VOTES;
-
-        if (isDecidingVoter) {
-          log.info({ txId, listenerId: LISTENER_ID }, "This Listener is the execution coordinator");
-          // Run execution asynchronously to avoid blocking the event loop
+      // Atomic claim: exactly ONE listener wins the PENDING/VOTED -> APPROVED transition
+      // and becomes the execution coordinator. No race, no double execution.
+      const won = await db.transitionStatus(txId, ["PENDING", "VOTED"], "APPROVED");
+      if (won) {
+        log.info({ txId, listenerId: LISTENER_ID }, "Transaction APPROVED — this Listener is the execution coordinator");
+        const currentTx = await db.getTransaction(txId);
+        if (currentTx) {
           executeTransaction(currentTx, db).catch((err) => {
             log.error({ txId, err }, "Execution threw unexpectedly");
           });
         }
       } else {
-        log.debug({ txId, status: currentTx.status }, "Transaction already past VOTED state — coordinator already executing");
+        log.debug({ txId }, "Already APPROVED/executing — another Listener is coordinator");
       }
-    } else {
-      // Not yet decided — update status to VOTED
-      const current = await db.getTransaction(txId);
-      if (current?.status === "PENDING") {
-        await db.updateTransactionStatus(txId, "VOTED", {
-          approveVotes: consensus.approveCount,
-          rejectVotes: consensus.rejectCount,
-        });
-      }
+      return;
     }
+
+    // Not yet decided
+    await db.transitionStatus(txId, ["PENDING"], "VOTED");
   };
 
   // ── Cancel handler ─────────────────────────────────────────────────────────
 
   const onCancel = async (txId: string, _sender: string) => {
-    const tx = await db.getTransaction(txId);
-    if (!tx) return;
-    if (["EXECUTED", "FAILED", "REJECTED"].includes(tx.status)) return;
-    await db.updateTransactionStatus(txId, "REJECTED", { errorMessage: "Cancelled by sender" });
-    log.info({ txId }, "Transaction cancelled by sender — marked REJECTED");
+    const changed = await db.transitionStatus(txId, ["PENDING", "VOTED", "APPROVED"], "REJECTED", {
+      errorMessage: "Cancelled by sender",
+    });
+    if (changed) log.info({ txId }, "Transaction cancelled by sender — marked REJECTED");
   };
 
   // ── Start listening ────────────────────────────────────────────────────────
@@ -249,7 +236,7 @@ async function main() {
       const timedOut = await db.getTimedOutTransactions(TX_TIMEOUT_MS);
       for (const tx of timedOut) {
         log.warn({ txId: tx.txId, status: tx.status, ageMs: Date.now() - tx.createdAt }, "Transaction timed out");
-        await db.updateTransactionStatus(tx.txId, "TIMED_OUT", {
+        await db.transitionStatus(tx.txId, [tx.status], "TIMED_OUT", {
           errorMessage: `Timed out after ${TX_TIMEOUT_MS}ms in status ${tx.status}`,
         });
       }

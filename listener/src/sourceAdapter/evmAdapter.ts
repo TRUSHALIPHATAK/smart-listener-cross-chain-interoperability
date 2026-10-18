@@ -13,6 +13,7 @@ import {
   SENDER_CONTRACT_ADDRESS,
   POLL_INTERVAL_MS,
   CONFIRMATIONS,
+  START_BLOCK,
 } from "../config";
 
 const log = childLogger("evmAdapter");
@@ -47,7 +48,9 @@ export class EvmSourceAdapter {
     }
 
     this.contract = new ethers.Contract(SENDER_CONTRACT_ADDRESS, SENDER_ABI, this.provider);
-    this.lastProcessedBlock = await this.provider.getBlockNumber() - 1;
+    // Replay from START_BLOCK so events emitted while this listener was down are not lost
+    // (safe: votes are idempotent per listener).
+    this.lastProcessedBlock = START_BLOCK - 1;
     log.info({ address: SENDER_CONTRACT_ADDRESS, startBlock: this.lastProcessedBlock }, "SenderContract attached");
   }
 

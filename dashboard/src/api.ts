@@ -25,14 +25,14 @@ export interface Transaction {
 
 export interface Vote {
   txId: string;
-  listenerId: "A" | "B" | "C";
+  listenerId: "A" | "B" | "C" | "D";
   vote: "APPROVE" | "REJECT";
   reason?: string;
   votedAt: number;
 }
 
 export interface ListenerHeartbeat {
-  listenerId: "A" | "B" | "C";
+  listenerId: "A" | "B" | "C" | "D";
   lastSeenAt: number;
   sourceChainConnected: boolean;
   lastProcessedBlock: number;

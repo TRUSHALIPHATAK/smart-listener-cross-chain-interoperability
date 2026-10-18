@@ -67,6 +67,13 @@ interface DbAdapter {
   upsertTransaction(tx: CrossChainTransaction): Promise<void>;
   getTransaction(txId: string): Promise<CrossChainTransaction | null>;
   updateTransactionStatus(txId: string, status: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<void>;
+  /**
+   * Atomic compare-and-set: moves the tx to `to` only if its current status is in `from`.
+   * Returns true if THIS call performed the transition (used to elect exactly one executor).
+   */
+  transitionStatus(txId: string, from: TxStatus[], to: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<boolean>;
+  /** Largest updated_at across transactions (0 if none) — used to push WebSocket updates */
+  getLastUpdatedAt(): Promise<number>;
   listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]>;
   countTransactions(status?: TxStatus): Promise<number>;
 
@@ -338,6 +345,28 @@ class SqliteAdapter implements DbAdapter {
     });
   }
 
+  async transitionStatus(txId: string, from: TxStatus[], to: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<boolean> {
+    return this.withWrite(() => {
+      const marks = from.map(() => "?").join(",");
+      this.run(`
+        UPDATE transactions SET
+          status = ?,
+          updated_at = ?,
+          dest_tx_hash  = COALESCE(?, dest_tx_hash),
+          error_message = COALESCE(?, error_message)
+        WHERE tx_id = ? AND status IN (${marks})
+      `, [to, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null, txId, ...from]);
+      return this.db.getRowsModified() > 0;
+    });
+  }
+
+  async getLastUpdatedAt(): Promise<number> {
+    return this.withRead(() => {
+      const row = this.queryOne("SELECT MAX(updated_at) as m FROM transactions");
+      return Number(row?.m ?? 0);
+    });
+  }
+
   async listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]> {
     return this.withRead(() => {
       let sql = "SELECT * FROM transactions";
@@ -540,6 +569,22 @@ class PostgresAdapter implements DbAdapter {
       WHERE tx_id = $7
     `, [status, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null,
         extra?.approveVotes ?? null, extra?.rejectVotes ?? null, txId]);
+  }
+
+  async transitionStatus(txId: string, from: TxStatus[], to: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<boolean> {
+    const r = await this.pool.query(`
+      UPDATE transactions SET
+        status = $1, updated_at = $2,
+        dest_tx_hash  = COALESCE($3, dest_tx_hash),
+        error_message = COALESCE($4, error_message)
+      WHERE tx_id = $5 AND status = ANY($6::text[])
+    `, [to, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null, txId, from]);
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async getLastUpdatedAt(): Promise<number> {
+    const r = await this.pool.query("SELECT MAX(updated_at) AS m FROM transactions");
+    return Number(r.rows[0]?.m ?? 0);
   }
 
   async listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]> {

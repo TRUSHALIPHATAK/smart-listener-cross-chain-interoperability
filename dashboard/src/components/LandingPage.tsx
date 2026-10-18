@@ -144,13 +144,13 @@ const steps: { icon: IconName; title: string; body: string }[] = [
   },
   {
     icon: "eye",
-    title: "Three Smart Listeners",
-    body: "Three independent off-chain Smart Listener processes each monitor the source chain independently. Each listener validates the event — checking txId format, payload, destination, and timestamp — then casts an individual APPROVE or REJECT vote.",
+    title: "Four Smart Listeners",
+    body: "Four independent off-chain Smart Listener processes each monitor the source chain independently. Each listener validates the event — checking txId format, payload, destination, and timestamp — then casts an individual APPROVE or REJECT vote.",
   },
   {
     icon: "vote",
-    title: "2-of-3 Consensus",
-    body: "Votes are tallied in a shared database. When 2 of the 3 listeners approve, consensus is reached and the transaction is marked APPROVED. If 2 listeners reject, it becomes REJECTED. No cryptography — these are independent votes.",
+    title: "Majority Consensus (3-of-4)",
+    body: "Votes are tallied in a shared database. When 3 of the 4 listeners approve, consensus is reached and the transaction is marked APPROVED. If 2 listeners reject (making 3 approvals impossible), it becomes REJECTED. No cryptography — these are independent votes.",
   },
   {
     icon: "bolt",
@@ -166,7 +166,7 @@ const steps: { icon: IconName; title: string; body: string }[] = [
 
 const features: { icon: IconName; label: string; desc: string }[] = [
   { icon: "link", label: "Heterogeneous chains", desc: "EVM + Hyperledger Fabric adapter interface" },
-  { icon: "scale", label: "2-of-3 majority vote", desc: "Independent Listeners, no threshold crypto" },
+  { icon: "scale", label: "3-of-4 majority vote", desc: "Independent Listeners, no threshold crypto" },
   { icon: "repeat", label: "Replay protection", desc: "Per-sender nonces + unique txIds" },
   { icon: "clock", label: "Timeout handling", desc: "Configurable TX_TIMEOUT_MS sweep" },
   { icon: "retry", label: "Retry & recovery", desc: "Exponential backoff, up to MAX_RETRIES" },
@@ -175,8 +175,8 @@ const features: { icon: IconName; label: string; desc: string }[] = [
 
 const architecture: { icon: IconName; title: string; sub: string }[] = [
   { icon: "chain", title: "Source Chain", sub: "Hardhat" },
-  { icon: "eye", title: "Smart Listeners", sub: "A · B · C" },
-  { icon: "vote", title: "2-of-3 Consensus", sub: "Majority vote" },
+  { icon: "eye", title: "Smart Listeners", sub: "A · B · C · D" },
+  { icon: "vote", title: "Majority Consensus (3-of-4)", sub: "Majority vote" },
   { icon: "flag", title: "Destination", sub: "Simulated" },
 ];
 
@@ -201,7 +201,7 @@ export const LandingPage: React.FC<Props> = ({ onNavigate }) => (
       </h1>
       <p className="hero-sub">
         A modular, research-backed interoperability framework that bridges heterogeneous blockchain
-        networks using three independent off-chain Smart Listeners and an optimistic 2-of-3 approval
+        networks using four independent off-chain Smart Listeners and an optimistic majority (3-of-4) approval
         consensus — without requiring cross-chain atomicity or threshold cryptography.
       </p>
       <div className="hero-cta">
@@ -298,7 +298,7 @@ export const LandingPage: React.FC<Props> = ({ onNavigate }) => (
       <p>
         <strong>Research prototype disclaimer:</strong> This system implements optimistic
         best-effort cross-chain messaging. It does <em>not</em> guarantee atomic execution,
-        cross-chain rollback, or exactly-once delivery. The three Listener votes are independent
+        cross-chain rollback, or exactly-once delivery. The four Listener votes are independent
         majority-vote signals — not threshold cryptography. Use in production requires additional
         safety analysis.
       </p>

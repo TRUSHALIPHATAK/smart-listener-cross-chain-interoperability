@@ -2,7 +2,7 @@
 
 A modular prototype of the **Smart Listeners** hybrid-optimistic inter-blockchain communication protocol (inspired by Bigiotti et al., 2025).
 
-Three independent off-chain listeners watch a source-chain contract, cast separate approval/rejection votes, and forward a request only when **at least 2 of 3** approve. The first working demo uses a **local Hardhat** network and a clearly labelled **[SIMULATED]** destination adapter. A Hyperledger Fabric adapter stub is included for later integration.
+Four independent off-chain listeners watch a source-chain contract, cast separate approval/rejection votes, and forward a request only when **at least 3 of 4** (a strict majority) approve. The first working demo uses a **local Hardhat** network and a clearly labelled **[SIMULATED]** destination adapter. A Hyperledger Fabric adapter stub is included for later integration.
 
 > This system does **not** claim cross-chain atomicity or guaranteed rollback. Listener approvals are independent votes, not threshold cryptography.
 
@@ -13,13 +13,13 @@ Three independent off-chain listeners watch a source-chain contract, cast separa
 | Area | Status |
 |------|--------|
 | `SenderContract.sol` / `ReceiverMock.sol` | Implemented + Hardhat tests |
-| 2-of-3 consensus module | Implemented + Jest unit tests |
+| Majority (3-of-4) consensus module | Implemented + Jest unit tests |
 | EVM source adapter (ethers.js) | Implemented |
 | Simulated destination adapter | Implemented |
 | Fabric destination adapter | Stub only (`DESTINATION_TYPE=fabric`) |
 | Express API + WebSocket push path | Implemented |
 | Persistent storage (sql.js SQLite) | Implemented (no Visual Studio / native build) |
-| Three listener processes + heartbeats | Implemented |
+| Four listener processes + heartbeats | Implemented |
 | React/Vite dashboard (pink theme) | Implemented (live API data) |
 | PowerShell one-script launcher | `start-all.ps1` |
 
@@ -85,7 +85,7 @@ npm run deploy:local
 # Terminal 3 — API
 npm run api
 
-# Terminal 4 — three listeners
+# Terminal 4 — four listeners
 npm run listeners
 
 # Terminal 5 — dashboard
@@ -103,8 +103,8 @@ Important variables:
 | Variable | Default | Meaning |
 |----------|---------|---------|
 | `SOURCE_RPC_URL` | `http://127.0.0.1:8545` | Source chain RPC |
-| `REQUIRED_VOTES` | `2` | Approvals needed |
-| `TOTAL_LISTENERS` | `3` | Listener count |
+| `REQUIRED_VOTES` | `3` | Approvals needed (must be a strict majority) |
+| `TOTAL_LISTENERS` | `4` | Listener count (max 4: A–D) |
 | `DESTINATION_TYPE` | `simulated` | `simulated` or `fabric` (stub) |
 | `API_PORT` | `3001` | REST API port |
 | `DATABASE_URL` | *(unset)* | If set → PostgreSQL; else sql.js SQLite |
@@ -123,6 +123,7 @@ Never hardcode private keys. Hardhat’s well-known local accounts are for local
 | GET | `/api/transactions/:txId` | Detail + votes |
 | GET | `/api/listeners` | Heartbeats + online flag |
 | GET | `/api/metrics` | Counts, latency, throughput |
+| POST | `/api/transactions/submit` | Submit via SenderContract (local demo key) |
 
 Dashboard Vite proxy forwards `/api` and `/ws` to port 3001.
 
@@ -162,8 +163,8 @@ start-all.ps1        One-command local launcher
 ## Transaction flow
 
 1. Caller submits via `SenderContract` → `TransactionSent` event  
-2. Each of three listeners validates independently and votes  
-3. At ≥2 APPROVE → status `APPROVED` → deciding voter runs executor  
+2. Each of four listeners validates independently and votes  
+3. At ≥3 APPROVE → status `APPROVED` → deciding voter runs executor  
 4. `[SIMULATED]` destination adapter returns a fake dest hash (or failure)  
 5. Dashboard shows status, votes, errors, and timing from the API  
 

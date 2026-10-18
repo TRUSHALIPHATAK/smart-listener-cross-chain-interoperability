@@ -164,8 +164,8 @@ app.get("/api/metrics", async (_req: Request, res: Response) => {
 
 // ── POST /api/transactions/submit ─────────────────────────────────────────────
 // Submits a cross-chain tx to the SenderContract on the local Hardhat node.
-// Body: { destinationChainId?: string, destinationAddress?: string, payload: string, privateKey?: string }
-// privateKey should come from the client (Hardhat test account) — never stored.
+// Body: { destinationChainId?: string, destinationAddress?: string, payload: string }
+// Signs with the local Hardhat account #0 (demo only). Clients can NOT supply keys.
 
 app.post("/api/transactions/submit", async (req: Request, res: Response) => {
   try {
@@ -173,12 +173,10 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
       destinationChainId = "simulated-evm-chain",
       destinationAddress = "0xRecipientAddress",
       payload,
-      privateKey,
     } = req.body as {
       destinationChainId?: string;
       destinationAddress?: string;
       payload?: string;
-      privateKey?: string;
     };
 
     if (!payload || payload.trim() === "") {
@@ -192,9 +190,8 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
       });
     }
 
-    // Use provided private key OR Hardhat default account #0
-    const HARDHAT_DEFAULT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-    const signerKey = privateKey || HARDHAT_DEFAULT_KEY;
+    // Hardhat default account #0 — local demo only, never accepted from the client
+    const signerKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
     const wallet   = new ethers.Wallet(signerKey, provider);
@@ -268,6 +265,22 @@ async function startServer() {
       log.debug("WebSocket client disconnected");
     });
   });
+
+  // Push a WebSocket message whenever any transaction changes (listeners run in other processes,
+  // so the API watches the shared DB instead of being called directly).
+  let lastSeen = await (await getDb()).getLastUpdatedAt();
+  setInterval(async () => {
+    try {
+      const db = await getDb();
+      const latest = await db.getLastUpdatedAt();
+      if (latest !== lastSeen) {
+        lastSeen = latest;
+        broadcastUpdate({ lastUpdatedAt: latest });
+      }
+    } catch (err) {
+      log.warn({ err }, "WS change-watcher error");
+    }
+  }, 1000);
 
   server.listen(API_PORT, API_HOST, () => {
     log.info({ port: API_PORT, host: API_HOST }, "API server listening");
