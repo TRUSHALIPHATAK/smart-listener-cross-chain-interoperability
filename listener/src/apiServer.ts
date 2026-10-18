@@ -7,6 +7,7 @@
  *   GET  /api/transactions/:txId    full detail + votes
  *   GET  /api/listeners             heartbeat status
  *   GET  /api/metrics               latency, throughput, counts
+ *   POST /api/transactions/submit   submit a tx via the SenderContract
  *
  * WebSocket (ws://host:port/ws):
  *   Server pushes { type: "update", data: <transaction> } on state changes
@@ -15,11 +16,28 @@
 import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
 import * as http from "http";
+import * as fs from "fs";
+import * as path from "path";
+import { ethers } from "ethers";
 import { WebSocketServer, WebSocket } from "ws";
 import { getDb, closeDb } from "./db";
 import { childLogger } from "./logger";
-import { API_PORT, API_HOST } from "./config";
+import { API_PORT, API_HOST, SOURCE_RPC_URL } from "./config";
 import { TxStatus } from "./types";
+
+// ── SenderContract ABI (minimal — only sendCrossChainTransaction) ──────────────
+const SENDER_ABI = [
+  "function sendCrossChainTransaction(bytes32 destinationChainId, bytes calldata destinationAddress, bytes calldata payload) external returns (bytes32 txId)",
+  "function getNonce(address sender) external view returns (uint256)",
+];
+
+function loadDeploymentContracts(): { SenderContract?: string } {
+  const p = path.join(__dirname, "..", "config", "deployment.json");
+  if (fs.existsSync(p)) {
+    try { return JSON.parse(fs.readFileSync(p, "utf8")).contracts ?? {}; } catch { /* fall through */ }
+  }
+  return {};
+}
 
 const log = childLogger("apiServer");
 const app = express();
@@ -144,7 +162,97 @@ app.get("/api/metrics", async (_req: Request, res: Response) => {
   }
 });
 
+// ── POST /api/transactions/submit ─────────────────────────────────────────────
+// Submits a cross-chain tx to the SenderContract on the local Hardhat node.
+// Body: { destinationChainId?: string, destinationAddress?: string, payload: string, privateKey?: string }
+// privateKey should come from the client (Hardhat test account) — never stored.
+
+app.post("/api/transactions/submit", async (req: Request, res: Response) => {
+  try {
+    const {
+      destinationChainId = "simulated-evm-chain",
+      destinationAddress = "0xRecipientAddress",
+      payload,
+      privateKey,
+    } = req.body as {
+      destinationChainId?: string;
+      destinationAddress?: string;
+      payload?: string;
+      privateKey?: string;
+    };
+
+    if (!payload || payload.trim() === "") {
+      return res.status(400).json({ error: "payload is required" });
+    }
+
+    const contracts = loadDeploymentContracts();
+    if (!contracts.SenderContract) {
+      return res.status(503).json({
+        error: "SenderContract not deployed. Run `npm run deploy:local` first.",
+      });
+    }
+
+    // Use provided private key OR Hardhat default account #0
+    const HARDHAT_DEFAULT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+    const signerKey = privateKey || HARDHAT_DEFAULT_KEY;
+
+    const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
+    const wallet   = new ethers.Wallet(signerKey, provider);
+    const contract = new ethers.Contract(contracts.SenderContract, SENDER_ABI, wallet);
+
+    const destChainBytes32 = ethers.encodeBytes32String(destinationChainId.slice(0, 31));
+    const destAddressBytes  = ethers.toUtf8Bytes(destinationAddress);
+    const payloadBytes      = ethers.toUtf8Bytes(payload);
+
+    log.info({ payload: payload.slice(0, 50), dest: destinationChainId }, "Submitting cross-chain tx");
+
+    const txn = await contract.sendCrossChainTransaction(
+      destChainBytes32,
+      destAddressBytes,
+      payloadBytes
+    );
+    const receipt = await txn.wait();
+
+    // Extract the emitted txId
+    const iface = new ethers.Interface([
+      "event TransactionSent(bytes32 indexed txId, address indexed sender, bytes32 indexed destinationChainId, bytes destinationAddress, bytes payload, uint256 nonce, uint256 timestamp)",
+    ]);
+    const parsedLog = receipt?.logs
+      .map((l: ethers.Log) => { try { return iface.parseLog({ topics: [...l.topics], data: l.data }); } catch { return null; } })
+      .find((e) => e?.name === "TransactionSent");
+
+    const txId = parsedLog?.args?.txId ?? null;
+
+    log.info({ txId, hash: receipt?.hash, block: receipt?.blockNumber }, "Cross-chain tx submitted");
+
+    return res.json({
+      success: true,
+      txId,
+      transactionHash: receipt?.hash,
+      blockNumber: receipt?.blockNumber,
+      senderAddress: wallet.address,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.error({ err: msg }, "POST /api/transactions/submit error");
+    return res.status(500).json({ error: msg });
+  }
+});
+
+// ── GET /api/deployment ───────────────────────────────────────────────────────
+
+app.get("/api/deployment", (_req: Request, res: Response) => {
+  const contracts = loadDeploymentContracts();
+  const hasDeployment = !!contracts.SenderContract;
+  res.json({
+    deployed: hasDeployment,
+    contracts,
+    rpcUrl: SOURCE_RPC_URL,
+  });
+});
+
 // ── Server Bootstrap ──────────────────────────────────────────────────────────
+
 
 async function startServer() {
   await getDb(); // initialise DB schema

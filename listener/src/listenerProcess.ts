@@ -45,8 +45,24 @@ function validateTransactionEvent(event: TransactionEvent): { valid: boolean; re
   if (event.timestamp <= 0n) {
     return { valid: false, reason: "Invalid timestamp" };
   }
+
+  // ── Rejection test support ────────────────────────────────────────────────
+  // Any payload whose UTF-8 decoded form starts with "REJECT:" causes all
+  // Listeners to cast a REJECT vote, so the tx ends up REJECTED by consensus.
+  // This is intentional test behaviour — not a production security rule.
+  try {
+    const payloadHex = event.payload.startsWith("0x") ? event.payload.slice(2) : event.payload;
+    const decoded = Buffer.from(payloadHex, "hex").toString("utf8");
+    if (decoded.startsWith("REJECT:")) {
+      return { valid: false, reason: `Test rejection triggered by payload prefix: ${decoded.slice(0, 40)}` };
+    }
+  } catch {
+    // If decoding fails, leave validation to pass (the payload is binary, not a REJECT test)
+  }
+
   return { valid: true };
 }
+
 
 // ── Main Process ──────────────────────────────────────────────────────────────
 
