@@ -18,7 +18,8 @@ import { EvmSourceAdapter } from "./sourceAdapter/evmAdapter";
 import { evaluateConsensus, validateVote } from "./consensus";
 import { executeTransaction } from "./executor";
 import { childLogger } from "./logger";
-import { printConfig } from "./config";
+import { printConfig, DESTINATION_TYPE } from "./config";
+import { DestinationWatcher } from "./destinationWatcher";
 import {
   LISTENER_ID, REQUIRED_VOTES, TOTAL_LISTENERS, TX_TIMEOUT_MS,
   POLL_INTERVAL_MS,
@@ -92,6 +93,13 @@ async function main() {
   };
 
   await connect();
+
+  // Step 2: confirm completion by watching the destination chain's InterChainCompleted event
+  let destWatcher: DestinationWatcher | null = null;
+  if (DESTINATION_TYPE === "evm") {
+    destWatcher = new DestinationWatcher(db);
+    destWatcher.start();
+  }
 
   // ── Event handler ──────────────────────────────────────────────────────────
 
@@ -255,6 +263,7 @@ async function main() {
 
   const shutdown = async (signal: string) => {
     log.info({ signal }, "Shutting down...");
+    destWatcher?.stop();
     await sourceAdapter.stop();
     await closeDb();
     process.exit(0);
