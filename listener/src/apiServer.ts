@@ -219,7 +219,7 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
     ]);
     const parsedLog = receipt?.logs
       .map((l: ethers.Log) => { try { return iface.parseLog({ topics: [...l.topics], data: l.data }); } catch { return null; } })
-      .find((e) => e?.name === "TransactionSent");
+      .find((e: { name?: string } | null) => e?.name === "TransactionSent");
 
     const txId = parsedLog?.args?.txId ?? null;
 
