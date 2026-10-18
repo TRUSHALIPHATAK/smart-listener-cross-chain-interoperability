@@ -1,0 +1,794 @@
+diff --git a/.env.example b/.env.example
+index 5967f9b..f8087be 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,7 +1,7 @@
+ # ── Smart Listener configuration ──────────────────────────────────────────
+ # Copy to .env and adjust. Never commit real private keys.
+ 
+-# Listener identity (set per process: A, B, or C)
++# Listener identity (set per process: A, B, C or D)
+ # LISTENER_ID=A
+ 
+ # Source chain (local Hardhat by default)
+@@ -15,8 +15,12 @@ CONFIRMATIONS=1
+ # RECEIVER_MOCK_ADDRESS=
+ 
+ # Consensus
+-REQUIRED_VOTES=2
+-TOTAL_LISTENERS=3
++# Strict majority required (paper: t >= n/2 + 1). 4 listeners -> 3 votes.
++REQUIRED_VOTES=3
++TOTAL_LISTENERS=4
++
++# First block listeners scan on startup (0 = replay all; votes are idempotent)
++START_BLOCK=0
+ 
+ # Timing
+ TX_TIMEOUT_MS=60000
+@@ -40,7 +44,7 @@ SIMULATED_FAILURE_RATE=0.05
+ 
+ # API
+ API_PORT=3001
+-API_HOST=0.0.0.0
++API_HOST=127.0.0.1
+ 
+ # Logging
+ LOG_LEVEL=info
+diff --git a/README.md b/README.md
+index 720b29a..8eb254d 100644
+--- a/README.md
++++ b/README.md
+@@ -2,7 +2,7 @@
+ 
+ A modular prototype of the **Smart Listeners** hybrid-optimistic inter-blockchain communication protocol (inspired by Bigiotti et al., 2025).
+ 
+-Three independent off-chain listeners watch a source-chain contract, cast separate approval/rejection votes, and forward a request only when **at least 2 of 3** approve. The first working demo uses a **local Hardhat** network and a clearly labelled **[SIMULATED]** destination adapter. A Hyperledger Fabric adapter stub is included for later integration.
++Four independent off-chain listeners watch a source-chain contract, cast separate approval/rejection votes, and forward a request only when **at least 3 of 4** (a strict majority) approve. The first working demo uses a **local Hardhat** network and a clearly labelled **[SIMULATED]** destination adapter. A Hyperledger Fabric adapter stub is included for later integration.
+ 
+ > This system does **not** claim cross-chain atomicity or guaranteed rollback. Listener approvals are independent votes, not threshold cryptography.
+ 
+@@ -13,13 +13,13 @@ Three independent off-chain listeners watch a source-chain contract, cast separa
+ | Area | Status |
+ |------|--------|
+ | `SenderContract.sol` / `ReceiverMock.sol` | Implemented + Hardhat tests |
+-| 2-of-3 consensus module | Implemented + Jest unit tests |
++| Majority (3-of-4) consensus module | Implemented + Jest unit tests |
+ | EVM source adapter (ethers.js) | Implemented |
+ | Simulated destination adapter | Implemented |
+ | Fabric destination adapter | Stub only (`DESTINATION_TYPE=fabric`) |
+ | Express API + WebSocket push path | Implemented |
+ | Persistent storage (sql.js SQLite) | Implemented (no Visual Studio / native build) |
+-| Three listener processes + heartbeats | Implemented |
++| Four listener processes + heartbeats | Implemented |
+ | React/Vite dashboard (pink theme) | Implemented (live API data) |
+ | PowerShell one-script launcher | `start-all.ps1` |
+ 
+@@ -85,7 +85,7 @@ npm run deploy:local
+ # Terminal 3 — API
+ npm run api
+ 
+-# Terminal 4 — three listeners
++# Terminal 4 — four listeners
+ npm run listeners
+ 
+ # Terminal 5 — dashboard
+@@ -103,8 +103,8 @@ Important variables:
+ | Variable | Default | Meaning |
+ |----------|---------|---------|
+ | `SOURCE_RPC_URL` | `http://127.0.0.1:8545` | Source chain RPC |
+-| `REQUIRED_VOTES` | `2` | Approvals needed |
+-| `TOTAL_LISTENERS` | `3` | Listener count |
++| `REQUIRED_VOTES` | `3` | Approvals needed (must be a strict majority) |
++| `TOTAL_LISTENERS` | `4` | Listener count (max 4: A–D) |
+ | `DESTINATION_TYPE` | `simulated` | `simulated` or `fabric` (stub) |
+ | `API_PORT` | `3001` | REST API port |
+ | `DATABASE_URL` | *(unset)* | If set → PostgreSQL; else sql.js SQLite |
+@@ -123,6 +123,7 @@ Never hardcode private keys. Hardhat’s well-known local accounts are for local
+ | GET | `/api/transactions/:txId` | Detail + votes |
+ | GET | `/api/listeners` | Heartbeats + online flag |
+ | GET | `/api/metrics` | Counts, latency, throughput |
++| POST | `/api/transactions/submit` | Submit via SenderContract (local demo key) |
+ 
+ Dashboard Vite proxy forwards `/api` and `/ws` to port 3001.
+ 
+@@ -162,8 +163,8 @@ start-all.ps1        One-command local launcher
+ ## Transaction flow
+ 
+ 1. Caller submits via `SenderContract` → `TransactionSent` event  
+-2. Each of three listeners validates independently and votes  
+-3. At ≥2 APPROVE → status `APPROVED` → deciding voter runs executor  
++2. Each of four listeners validates independently and votes  
++3. At ≥3 APPROVE → status `APPROVED` → deciding voter runs executor  
+ 4. `[SIMULATED]` destination adapter returns a fake dest hash (or failure)  
+ 5. Dashboard shows status, votes, errors, and timing from the API  
+ 
+diff --git a/dashboard/src/App.tsx b/dashboard/src/App.tsx
+index 4829a22..4b64c2e 100644
+--- a/dashboard/src/App.tsx
++++ b/dashboard/src/App.tsx
+@@ -204,7 +204,7 @@ export default function App() {
+     setSubmittedHash("");
+ 
+     try {
+-      const response = await fetch("/api/transactions", {
++      const response = await fetch("/api/transactions/submit", {
+         method: "POST",
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({ destinationAddress, payload }),
+@@ -249,6 +249,7 @@ export default function App() {
+         ["Executed", metrics.executed],
+         ["Failed", metrics.failed],
+         ["Rejected", metrics.rejected],
++        ["Timed out", metrics.timedOut],
+         ["Average latency", `${metrics.avgLatencyMs} ms`],
+         ["Throughput", `${metrics.throughputPerMinute}/min`],
+       ]
+@@ -496,8 +497,8 @@ export default function App() {
+                 <Panel title="What happens next">
+                   <ol className="workflow-list">
+                     <li>The source contract emits a transaction event.</li>
+-                    <li>Three independent listeners validate the event and cast votes.</li>
+-                    <li>Two matching approval votes are required for approval.</li>
++                    <li>Four independent listeners validate the event and cast votes.</li>
++                    <li>Three matching approval votes (a strict majority of four) are required.</li>
+                     <li>The destination adapter processes an approved transaction.</li>
+                   </ol>
+                   <p className="form-hint" style={{ marginTop: 16 }}>
+@@ -512,7 +513,7 @@ export default function App() {
+ 
+       <footer className="footer">
+         <span>
+-          Smart Listener · Bigiotti et al. (2025) · Optimistic 2-of-3 Inter-Blockchain Protocol
++          Smart Listener · Bigiotti et al. (2025) · Majority-vote variant of the Smart Listeners protocol
+         </span>
+         <span className="footer-note">
+           Simulated destination · No cross-chain atomicity guarantee
+diff --git a/dashboard/src/api.ts b/dashboard/src/api.ts
+index 26fe3a9..cbd10d0 100644
+--- a/dashboard/src/api.ts
++++ b/dashboard/src/api.ts
+@@ -25,14 +25,14 @@ export interface Transaction {
+ 
+ export interface Vote {
+   txId: string;
+-  listenerId: "A" | "B" | "C";
++  listenerId: "A" | "B" | "C" | "D";
+   vote: "APPROVE" | "REJECT";
+   reason?: string;
+   votedAt: number;
+ }
+ 
+ export interface ListenerHeartbeat {
+-  listenerId: "A" | "B" | "C";
++  listenerId: "A" | "B" | "C" | "D";
+   lastSeenAt: number;
+   sourceChainConnected: boolean;
+   lastProcessedBlock: number;
+diff --git a/dashboard/src/components/LandingPage.tsx b/dashboard/src/components/LandingPage.tsx
+index 4aceca4..b15eb6a 100644
+--- a/dashboard/src/components/LandingPage.tsx
++++ b/dashboard/src/components/LandingPage.tsx
+@@ -144,13 +144,13 @@ const steps: { icon: IconName; title: string; body: string }[] = [
+   },
+   {
+     icon: "eye",
+-    title: "Three Smart Listeners",
+-    body: "Three independent off-chain Smart Listener processes each monitor the source chain independently. Each listener validates the event — checking txId format, payload, destination, and timestamp — then casts an individual APPROVE or REJECT vote.",
++    title: "Four Smart Listeners",
++    body: "Four independent off-chain Smart Listener processes each monitor the source chain independently. Each listener validates the event — checking txId format, payload, destination, and timestamp — then casts an individual APPROVE or REJECT vote.",
+   },
+   {
+     icon: "vote",
+-    title: "2-of-3 Consensus",
+-    body: "Votes are tallied in a shared database. When 2 of the 3 listeners approve, consensus is reached and the transaction is marked APPROVED. If 2 listeners reject, it becomes REJECTED. No cryptography — these are independent votes.",
++    title: "Majority Consensus (3-of-4)",
++    body: "Votes are tallied in a shared database. When 3 of the 4 listeners approve, consensus is reached and the transaction is marked APPROVED. If 2 listeners reject (making 3 approvals impossible), it becomes REJECTED. No cryptography — these are independent votes.",
+   },
+   {
+     icon: "bolt",
+@@ -166,7 +166,7 @@ const steps: { icon: IconName; title: string; body: string }[] = [
+ 
+ const features: { icon: IconName; label: string; desc: string }[] = [
+   { icon: "link", label: "Heterogeneous chains", desc: "EVM + Hyperledger Fabric adapter interface" },
+-  { icon: "scale", label: "2-of-3 majority vote", desc: "Independent Listeners, no threshold crypto" },
++  { icon: "scale", label: "3-of-4 majority vote", desc: "Independent Listeners, no threshold crypto" },
+   { icon: "repeat", label: "Replay protection", desc: "Per-sender nonces + unique txIds" },
+   { icon: "clock", label: "Timeout handling", desc: "Configurable TX_TIMEOUT_MS sweep" },
+   { icon: "retry", label: "Retry & recovery", desc: "Exponential backoff, up to MAX_RETRIES" },
+@@ -175,8 +175,8 @@ const features: { icon: IconName; label: string; desc: string }[] = [
+ 
+ const architecture: { icon: IconName; title: string; sub: string }[] = [
+   { icon: "chain", title: "Source Chain", sub: "Hardhat" },
+-  { icon: "eye", title: "Smart Listeners", sub: "A · B · C" },
+-  { icon: "vote", title: "2-of-3 Consensus", sub: "Majority vote" },
++  { icon: "eye", title: "Smart Listeners", sub: "A · B · C · D" },
++  { icon: "vote", title: "Majority Consensus (3-of-4)", sub: "Majority vote" },
+   { icon: "flag", title: "Destination", sub: "Simulated" },
+ ];
+ 
+@@ -201,7 +201,7 @@ export const LandingPage: React.FC<Props> = ({ onNavigate }) => (
+       </h1>
+       <p className="hero-sub">
+         A modular, research-backed interoperability framework that bridges heterogeneous blockchain
+-        networks using three independent off-chain Smart Listeners and an optimistic 2-of-3 approval
++        networks using four independent off-chain Smart Listeners and an optimistic majority (3-of-4) approval
+         consensus — without requiring cross-chain atomicity or threshold cryptography.
+       </p>
+       <div className="hero-cta">
+@@ -298,7 +298,7 @@ export const LandingPage: React.FC<Props> = ({ onNavigate }) => (
+       <p>
+         <strong>Research prototype disclaimer:</strong> This system implements optimistic
+         best-effort cross-chain messaging. It does <em>not</em> guarantee atomic execution,
+-        cross-chain rollback, or exactly-once delivery. The three Listener votes are independent
++        cross-chain rollback, or exactly-once delivery. The four Listener votes are independent
+         majority-vote signals — not threshold cryptography. Use in production requires additional
+         safety analysis.
+       </p>
+diff --git a/dashboard/src/components/TransactionDetail.tsx b/dashboard/src/components/TransactionDetail.tsx
+index 3a2b4d3..5ce7d7e 100644
+--- a/dashboard/src/components/TransactionDetail.tsx
++++ b/dashboard/src/components/TransactionDetail.tsx
+@@ -67,7 +67,7 @@ export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
+ 
+         <div style={{ padding: "12px 0", borderBottom: "1px solid #f5c0d0" }}>
+           <span style={{ fontSize: 11, fontWeight: 600, color: "#9b4a66", textTransform: "uppercase" }}>
+-            Listener Votes (2-of-3 required)
++            Listener Votes (3-of-4 required)
+           </span>
+           <div style={{ display: "flex", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+             {votes.length === 0 && (
+diff --git a/dashboard/src/index.css b/dashboard/src/index.css
+index 5c1bcb6..83dd99e 100644
+--- a/dashboard/src/index.css
++++ b/dashboard/src/index.css
+@@ -1334,4 +1334,8 @@ textarea::placeholder {
+   .steps-grid { grid-template-columns: 1fr; }
+   .step-card:nth-child(5) { grid-column: auto; }
+   .arch-box { flex-basis: 100%; max-width: none; }
+-}
+\ No newline at end of file
++}
++
++/* ---------- Step 0: 4 listeners + 9 metric cards ---------- */
++.listener-grid { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
++.metrics-grid  { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+diff --git a/listener/src/apiServer.ts b/listener/src/apiServer.ts
+index c6da1db..79dbdf2 100644
+--- a/listener/src/apiServer.ts
++++ b/listener/src/apiServer.ts
+@@ -164,8 +164,8 @@ app.get("/api/metrics", async (_req: Request, res: Response) => {
+ 
+ // ── POST /api/transactions/submit ─────────────────────────────────────────────
+ // Submits a cross-chain tx to the SenderContract on the local Hardhat node.
+-// Body: { destinationChainId?: string, destinationAddress?: string, payload: string, privateKey?: string }
+-// privateKey should come from the client (Hardhat test account) — never stored.
++// Body: { destinationChainId?: string, destinationAddress?: string, payload: string }
++// Signs with the local Hardhat account #0 (demo only). Clients can NOT supply keys.
+ 
+ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
+   try {
+@@ -173,12 +173,10 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
+       destinationChainId = "simulated-evm-chain",
+       destinationAddress = "0xRecipientAddress",
+       payload,
+-      privateKey,
+     } = req.body as {
+       destinationChainId?: string;
+       destinationAddress?: string;
+       payload?: string;
+-      privateKey?: string;
+     };
+ 
+     if (!payload || payload.trim() === "") {
+@@ -192,9 +190,8 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
+       });
+     }
+ 
+-    // Use provided private key OR Hardhat default account #0
+-    const HARDHAT_DEFAULT_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+-    const signerKey = privateKey || HARDHAT_DEFAULT_KEY;
++    // Hardhat default account #0 — local demo only, never accepted from the client
++    const signerKey = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+ 
+     const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
+     const wallet   = new ethers.Wallet(signerKey, provider);
+@@ -269,6 +266,22 @@ async function startServer() {
+     });
+   });
+ 
++  // Push a WebSocket message whenever any transaction changes (listeners run in other processes,
++  // so the API watches the shared DB instead of being called directly).
++  let lastSeen = await (await getDb()).getLastUpdatedAt();
++  setInterval(async () => {
++    try {
++      const db = await getDb();
++      const latest = await db.getLastUpdatedAt();
++      if (latest !== lastSeen) {
++        lastSeen = latest;
++        broadcastUpdate({ lastUpdatedAt: latest });
++      }
++    } catch (err) {
++      log.warn({ err }, "WS change-watcher error");
++    }
++  }, 1000);
++
+   server.listen(API_PORT, API_HOST, () => {
+     log.info({ port: API_PORT, host: API_HOST }, "API server listening");
+   });
+diff --git a/listener/src/config.ts b/listener/src/config.ts
+index cbbf043..47e3a89 100644
+--- a/listener/src/config.ts
++++ b/listener/src/config.ts
+@@ -1,6 +1,7 @@
+ import * as dotenv from "dotenv";
+ import * as path from "path";
+ import * as fs from "fs";
++import { LISTENER_IDS, ListenerId } from "./types";
+ 
+ dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
+ 
+@@ -27,16 +28,18 @@ function optionalInt(key: string, fallback: number): number {
+ // ── Listener Identity ─────────────────────────────────────────────────────────
+ 
+ const rawId = optional("LISTENER_ID", "A").toUpperCase();
+-if (!["A", "B", "C"].includes(rawId)) {
+-  throw new Error(`LISTENER_ID must be A, B, or C. Got: ${rawId}`);
++if (!(LISTENER_IDS as readonly string[]).includes(rawId)) {
++  throw new Error(`LISTENER_ID must be one of ${LISTENER_IDS.join(", ")}. Got: ${rawId}`);
+ }
+-export const LISTENER_ID = rawId as "A" | "B" | "C";
++export const LISTENER_ID = rawId as ListenerId;
+ 
+ // ── Source Chain ──────────────────────────────────────────────────────────────
+ 
+ export const SOURCE_RPC_URL     = optional("SOURCE_RPC_URL", "http://127.0.0.1:8545");
+ export const SOURCE_CHAIN_ID    = optionalInt("SOURCE_CHAIN_ID", 31337);
+ export const POLL_INTERVAL_MS   = optionalInt("POLL_INTERVAL_MS", 2000);
++/** First block to scan on startup (0 = replay from genesis; safe because votes are idempotent) */
++export const START_BLOCK        = optionalInt("START_BLOCK", 0);
+ export const CONFIRMATIONS      = optionalInt("CONFIRMATIONS", 1);
+ 
+ // ── Contract Addresses ────────────────────────────────────────────────────────
+@@ -61,9 +64,17 @@ export const RECEIVER_MOCK_ADDRESS   = process.env.RECEIVER_MOCK_ADDRESS   ?? de
+ // ── Consensus ─────────────────────────────────────────────────────────────────
+ 
+ /** Minimum approve votes needed to trigger execution */
+-export const REQUIRED_VOTES     = optionalInt("REQUIRED_VOTES", 2);
++export const REQUIRED_VOTES     = optionalInt("REQUIRED_VOTES", 3);
+ /** Total number of Listener processes */
+-export const TOTAL_LISTENERS    = optionalInt("TOTAL_LISTENERS", 3);
++export const TOTAL_LISTENERS    = optionalInt("TOTAL_LISTENERS", 4);
++
++// Paper (Bigiotti et al.) requires the signing threshold t >= n/2 + 1 (strict majority).
++if (TOTAL_LISTENERS > LISTENER_IDS.length) {
++  throw new Error(`TOTAL_LISTENERS (${TOTAL_LISTENERS}) exceeds supported listener IDs (${LISTENER_IDS.length})`);
++}
++if (REQUIRED_VOTES <= TOTAL_LISTENERS / 2 || REQUIRED_VOTES > TOTAL_LISTENERS) {
++  throw new Error(`REQUIRED_VOTES (${REQUIRED_VOTES}) must be a strict majority of TOTAL_LISTENERS (${TOTAL_LISTENERS})`);
++}
+ 
+ // ── Timing ────────────────────────────────────────────────────────────────────
+ 
+@@ -102,7 +113,7 @@ export const FABRIC_GATEWAY_URL = optional("FABRIC_GATEWAY_URL", "");
+ // ── API Server ────────────────────────────────────────────────────────────────
+ 
+ export const API_PORT           = optionalInt("API_PORT", 3001);
+-export const API_HOST           = optional("API_HOST", "0.0.0.0");
++export const API_HOST           = optional("API_HOST", "127.0.0.1");
+ 
+ // ── Logging ───────────────────────────────────────────────────────────────────
+ 
+diff --git a/listener/src/consensus.ts b/listener/src/consensus.ts
+index 973ce4b..65017fa 100644
+--- a/listener/src/consensus.ts
++++ b/listener/src/consensus.ts
+@@ -6,7 +6,7 @@
+  * Listener approvals are independent votes.
+  */
+ 
+-import { ListenerVote, VoteValue } from "./types";
++import { LISTENER_IDS, ListenerVote, VoteValue } from "./types";
+ 
+ export interface ConsensusResult {
+   approved: boolean;
+@@ -59,7 +59,7 @@ export function validateVote(
+   existingVotes: ListenerVote[]
+ ): string | null {
+   if (!txId || typeof txId !== "string") return "Invalid txId";
+-  if (!["A", "B", "C"].includes(listenerId)) return `Invalid listenerId: ${listenerId}`;
++  if (!(LISTENER_IDS as readonly string[]).includes(listenerId)) return `Invalid listenerId: ${listenerId}`;
+   if (!["APPROVE", "REJECT"].includes(vote)) return `Invalid vote value: ${vote}`;
+ 
+   const alreadyVoted = existingVotes.some((v) => v.listenerId === listenerId);
+diff --git a/listener/src/consensus.unit.test.ts b/listener/src/consensus.unit.test.ts
+index 3247ad8..ae049b3 100644
+--- a/listener/src/consensus.unit.test.ts
++++ b/listener/src/consensus.unit.test.ts
+@@ -5,7 +5,7 @@
+ import { evaluateConsensus, validateVote } from "./consensus";
+ import { ListenerVote } from "./types";
+ 
+-const makeVote = (listenerId: "A" | "B" | "C", vote: "APPROVE" | "REJECT"): ListenerVote => ({
++const makeVote = (listenerId: "A" | "B" | "C" | "D", vote: "APPROVE" | "REJECT"): ListenerVote => ({
+   txId: "0xabc",
+   listenerId,
+   vote,
+@@ -92,7 +92,7 @@ describe("validateVote", () => {
+   });
+ 
+   it("returns error for invalid listener ID", () => {
+-    expect(validateVote("0xabc", "D", "APPROVE", votes)).toMatch(/Invalid listenerId/);
++    expect(validateVote("0xabc", "E", "APPROVE", votes)).toMatch(/Invalid listenerId/);
+   });
+ 
+   it("returns error for invalid vote value", () => {
+@@ -104,3 +104,31 @@ describe("validateVote", () => {
+     expect(validateVote("", "B", "APPROVE", votes)).toMatch(/Invalid txId/);
+   });
+ });
++
++
++describe("evaluateConsensus — 3-of-4 (majority of four listeners)", () => {
++  const cfg = { requiredVotes: 3, totalListeners: 4 };
++
++  it("is undecided with 2 approvals and 1 vote outstanding", () => {
++    const r = evaluateConsensus([makeVote("A", "APPROVE"), makeVote("B", "APPROVE")], cfg);
++    expect(r.approved).toBe(false);
++    expect(r.rejected).toBe(false);
++    expect(r.decided).toBe(false);
++  });
++
++  it("approves at exactly 3 approvals", () => {
++    const r = evaluateConsensus([makeVote("A", "APPROVE"), makeVote("B", "APPROVE"), makeVote("D", "APPROVE")], cfg);
++    expect(r.approved).toBe(true);
++  });
++
++  it("rejects as soon as 2 rejects make 3 approvals impossible", () => {
++    const r = evaluateConsensus([makeVote("A", "REJECT"), makeVote("C", "REJECT")], cfg);
++    expect(r.rejected).toBe(true);
++    expect(r.approved).toBe(false);
++  });
++
++  it("accepts listener D as a valid voter", () => {
++    expect(validateVote("0xabc", "D", "APPROVE", [])).toBeNull();
++    expect(validateVote("0xabc", "E", "APPROVE", [])).not.toBeNull();
++  });
++});
+diff --git a/listener/src/db.ts b/listener/src/db.ts
+index a81b474..b0c01eb 100644
+--- a/listener/src/db.ts
++++ b/listener/src/db.ts
+@@ -67,6 +67,13 @@ interface DbAdapter {
+   upsertTransaction(tx: CrossChainTransaction): Promise<void>;
+   getTransaction(txId: string): Promise<CrossChainTransaction | null>;
+   updateTransactionStatus(txId: string, status: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<void>;
++  /**
++   * Atomic compare-and-set: moves the tx to `to` only if its current status is in `from`.
++   * Returns true if THIS call performed the transition (used to elect exactly one executor).
++   */
++  transitionStatus(txId: string, from: TxStatus[], to: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<boolean>;
++  /** Largest updated_at across transactions (0 if none) — used to push WebSocket updates */
++  getLastUpdatedAt(): Promise<number>;
+   listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]>;
+   countTransactions(status?: TxStatus): Promise<number>;
+ 
+@@ -338,6 +345,28 @@ class SqliteAdapter implements DbAdapter {
+     });
+   }
+ 
++  async transitionStatus(txId: string, from: TxStatus[], to: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<boolean> {
++    return this.withWrite(() => {
++      const marks = from.map(() => "?").join(",");
++      this.run(`
++        UPDATE transactions SET
++          status = ?,
++          updated_at = ?,
++          dest_tx_hash  = COALESCE(?, dest_tx_hash),
++          error_message = COALESCE(?, error_message)
++        WHERE tx_id = ? AND status IN (${marks})
++      `, [to, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null, txId, ...from]);
++      return this.db.getRowsModified() > 0;
++    });
++  }
++
++  async getLastUpdatedAt(): Promise<number> {
++    return this.withRead(() => {
++      const row = this.queryOne("SELECT MAX(updated_at) as m FROM transactions");
++      return Number(row?.m ?? 0);
++    });
++  }
++
+   async listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]> {
+     return this.withRead(() => {
+       let sql = "SELECT * FROM transactions";
+@@ -542,6 +571,22 @@ class PostgresAdapter implements DbAdapter {
+         extra?.approveVotes ?? null, extra?.rejectVotes ?? null, txId]);
+   }
+ 
++  async transitionStatus(txId: string, from: TxStatus[], to: TxStatus, extra?: Partial<CrossChainTransaction>): Promise<boolean> {
++    const r = await this.pool.query(`
++      UPDATE transactions SET
++        status = $1, updated_at = $2,
++        dest_tx_hash  = COALESCE($3, dest_tx_hash),
++        error_message = COALESCE($4, error_message)
++      WHERE tx_id = $5 AND status = ANY($6::text[])
++    `, [to, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null, txId, from]);
++    return (r.rowCount ?? 0) > 0;
++  }
++
++  async getLastUpdatedAt(): Promise<number> {
++    const r = await this.pool.query("SELECT MAX(updated_at) AS m FROM transactions");
++    return Number(r.rows[0]?.m ?? 0);
++  }
++
+   async listTransactions(opts?: { status?: TxStatus; limit?: number; offset?: number }): Promise<CrossChainTransaction[]> {
+     let sql = "SELECT * FROM transactions";
+     const params: (string | number)[] = [];
+diff --git a/listener/src/db.unit.test.ts b/listener/src/db.unit.test.ts
+index 7937e58..f40cd2d 100644
+--- a/listener/src/db.unit.test.ts
++++ b/listener/src/db.unit.test.ts
+@@ -91,4 +91,23 @@ describe("SqliteAdapter (sql.js)", () => {
+     expect(tx?.status).toBe("EXECUTED");
+     expect(tx?.destTxHash).toBe("0xSIM");
+   });
++
++  it("transitionStatus only succeeds once (atomic claim) and respects `from`", async () => {
++    await db.upsertTransaction({
++      txId: "0xclaim", sender: "0xS", destinationChainId: "0xd", destinationAddress: "0xa",
++      payload: "0x01", nonce: "1", sourceTimestamp: 1, sourceBlockNumber: 1,
++      status: "PENDING", createdAt: Date.now(), updatedAt: Date.now(), approveVotes: 0, rejectVotes: 0,
++    });
++    const first  = await db.transitionStatus("0xclaim", ["PENDING", "VOTED"], "APPROVED");
++    const second = await db.transitionStatus("0xclaim", ["PENDING", "VOTED"], "APPROVED");
++    expect(first).toBe(true);
++    expect(second).toBe(false);
++    // a late TIMED_OUT must not overwrite a different state
++    expect(await db.transitionStatus("0xclaim", ["PENDING"], "TIMED_OUT")).toBe(false);
++    expect((await db.getTransaction("0xclaim"))?.status).toBe("APPROVED");
++  });
++
++  it("reports the latest updated_at", async () => {
++    expect(await db.getLastUpdatedAt()).toBeGreaterThan(0);
++  });
+ });
+diff --git a/listener/src/executor.ts b/listener/src/executor.ts
+index 416dfa5..cfeed74 100644
+--- a/listener/src/executor.ts
++++ b/listener/src/executor.ts
+@@ -30,23 +30,12 @@ export async function executeTransaction(
+   tx: CrossChainTransaction,
+   db: DbAdapter
+ ): Promise<void> {
+-  // ── Idempotency guard ──────────────────────────────────────────────────────
+-  const current = await db.getTransaction(tx.txId);
+-  if (!current) {
+-    log.error({ txId: tx.txId }, "Transaction not found in DB — cannot execute");
++  // ── Atomic claim: only one executor may move APPROVED -> EXECUTING ─────────
++  const claimed = await db.transitionStatus(tx.txId, ["APPROVED"], "EXECUTING");
++  if (!claimed) {
++    log.warn({ txId: tx.txId }, "Could not claim transaction (not APPROVED any more) — skipping duplicate execution");
+     return;
+   }
+-  if (current.status === "EXECUTED") {
+-    log.warn({ txId: tx.txId }, "Transaction already EXECUTED — skipping (duplicate prevention)");
+-    return;
+-  }
+-  if (current.status === "FAILED" || current.status === "TIMED_OUT" || current.status === "REJECTED") {
+-    log.warn({ txId: tx.txId, status: current.status }, "Transaction in terminal state — skipping");
+-    return;
+-  }
+-
+-  // ── Mark EXECUTING ─────────────────────────────────────────────────────────
+-  await db.updateTransactionStatus(tx.txId, "EXECUTING");
+   log.info({ txId: tx.txId, destination: DESTINATION_TYPE }, "Beginning execution");
+ 
+   // ── Select destination adapter ─────────────────────────────────────────────
+@@ -73,15 +62,16 @@ export async function executeTransaction(
+ 
+   // ── Update final state ─────────────────────────────────────────────────────
+   if (lastResult.success) {
+-    await db.updateTransactionStatus(tx.txId, "EXECUTED", {
++    const ok = await db.transitionStatus(tx.txId, ["EXECUTING"], "EXECUTED", {
+       destTxHash: lastResult.destTxHash,
+     });
++    if (!ok) log.warn({ txId: tx.txId }, "Executed on destination but status was changed meanwhile (e.g. timed out)");
+     log.info(
+       { txId: tx.txId, destTxHash: lastResult.destTxHash, latencyMs: lastResult.latencyMs },
+       "Transaction EXECUTED successfully"
+     );
+   } else {
+-    await db.updateTransactionStatus(tx.txId, "FAILED", {
++    await db.transitionStatus(tx.txId, ["EXECUTING"], "FAILED", {
+       errorMessage: lastResult.errorMessage ?? "Unknown error after all retries",
+     });
+     log.error(
+diff --git a/listener/src/listenerProcess.ts b/listener/src/listenerProcess.ts
+index eb89d91..7173bd9 100644
+--- a/listener/src/listenerProcess.ts
++++ b/listener/src/listenerProcess.ts
+@@ -1,13 +1,13 @@
+ /**
+  * listenerProcess.ts — Main entry point for each Smart Listener process
+  *
+- * Run three instances with different LISTENER_ID env vars (A, B, C).
++ * Run four instances with different LISTENER_ID env vars (A, B, C, D).
+  * Each instance independently:
+  *   1. Connects to the source EVM chain
+  *   2. Monitors TransactionSent events
+  *   3. Validates each transaction
+  *   4. Records a vote in the shared DB
+- *   5. If 2-of-3 threshold is met AND this listener is elected coordinator,
++ *   5. If the majority threshold (default 3-of-4) is met AND this listener wins the atomic APPROVED claim,
+  *      triggers the executor
+  *   6. Runs timeout sweeper on a schedule
+  *   7. Emits heartbeat to DB
+@@ -133,7 +133,7 @@ async function main() {
+ 
+     // 4. Check for duplicate/already-executed
+     const existing = await db.getTransaction(txId);
+-    if (existing && ["EXECUTED", "FAILED", "REJECTED"].includes(existing.status)) {
++    if (existing && ["EXECUTED", "FAILED", "REJECTED", "TIMED_OUT"].includes(existing.status)) {
+       log.debug({ txId, status: existing.status }, "Transaction in terminal state — skipping vote");
+       return;
+     }
+@@ -165,55 +165,42 @@ async function main() {
+     log.info({ txId, ...consensus }, "Consensus state");
+ 
+     if (consensus.rejected) {
+-      await db.updateTransactionStatus(txId, "REJECTED", { errorMessage: "Insufficient approval votes" });
+-      log.warn({ txId }, "Transaction REJECTED by consensus");
++      const changed = await db.transitionStatus(txId, ["PENDING", "VOTED"], "REJECTED", {
++        errorMessage: "Insufficient approval votes",
++      });
++      if (changed) log.warn({ txId }, "Transaction REJECTED by consensus");
+       return;
+     }
+ 
+     if (consensus.approved) {
+-      const currentTx = await db.getTransaction(txId);
+-      if (!currentTx) return;
+-
+-      // Only update to APPROVED if not already executing/executed
+-      if (currentTx.status === "PENDING" || currentTx.status === "VOTED") {
+-        await db.updateTransactionStatus(txId, "APPROVED");
+-        log.info({ txId }, "Transaction APPROVED — triggering execution");
+-
+-        // Coordinator election: only the Listener that casts the deciding vote executes.
+-        // This prevents triple-execution while still recovering if the coordinator crashes.
+-        const isDecidingVoter = vote.vote === "APPROVE" &&
+-          consensus.approveCount === REQUIRED_VOTES;
+-
+-        if (isDecidingVoter) {
+-          log.info({ txId, listenerId: LISTENER_ID }, "This Listener is the execution coordinator");
+-          // Run execution asynchronously to avoid blocking the event loop
++      // Atomic claim: exactly ONE listener wins the PENDING/VOTED -> APPROVED transition
++      // and becomes the execution coordinator. No race, no double execution.
++      const won = await db.transitionStatus(txId, ["PENDING", "VOTED"], "APPROVED");
++      if (won) {
++        log.info({ txId, listenerId: LISTENER_ID }, "Transaction APPROVED — this Listener is the execution coordinator");
++        const currentTx = await db.getTransaction(txId);
++        if (currentTx) {
+           executeTransaction(currentTx, db).catch((err) => {
+             log.error({ txId, err }, "Execution threw unexpectedly");
+           });
+         }
+       } else {
+-        log.debug({ txId, status: currentTx.status }, "Transaction already past VOTED state — coordinator already executing");
+-      }
+-    } else {
+-      // Not yet decided — update status to VOTED
+-      const current = await db.getTransaction(txId);
+-      if (current?.status === "PENDING") {
+-        await db.updateTransactionStatus(txId, "VOTED", {
+-          approveVotes: consensus.approveCount,
+-          rejectVotes: consensus.rejectCount,
+-        });
++        log.debug({ txId }, "Already APPROVED/executing — another Listener is coordinator");
+       }
++      return;
+     }
++
++    // Not yet decided
++    await db.transitionStatus(txId, ["PENDING"], "VOTED");
+   };
+ 
+   // ── Cancel handler ─────────────────────────────────────────────────────────
+ 
+   const onCancel = async (txId: string, _sender: string) => {
+-    const tx = await db.getTransaction(txId);
+-    if (!tx) return;
+-    if (["EXECUTED", "FAILED", "REJECTED"].includes(tx.status)) return;
+-    await db.updateTransactionStatus(txId, "REJECTED", { errorMessage: "Cancelled by sender" });
+-    log.info({ txId }, "Transaction cancelled by sender — marked REJECTED");
++    const changed = await db.transitionStatus(txId, ["PENDING", "VOTED", "APPROVED"], "REJECTED", {
++      errorMessage: "Cancelled by sender",
++    });
++    if (changed) log.info({ txId }, "Transaction cancelled by sender — marked REJECTED");
+   };
+ 
+   // ── Start listening ────────────────────────────────────────────────────────
+@@ -249,7 +236,7 @@ async function main() {
+       const timedOut = await db.getTimedOutTransactions(TX_TIMEOUT_MS);
+       for (const tx of timedOut) {
+         log.warn({ txId: tx.txId, status: tx.status, ageMs: Date.now() - tx.createdAt }, "Transaction timed out");
+-        await db.updateTransactionStatus(tx.txId, "TIMED_OUT", {
++        await db.transitionStatus(tx.txId, [tx.status], "TIMED_OUT", {
+           errorMessage: `Timed out after ${TX_TIMEOUT_MS}ms in status ${tx.status}`,
+         });
+       }
+diff --git a/listener/src/sourceAdapter/evmAdapter.ts b/listener/src/sourceAdapter/evmAdapter.ts
+index 842c838..5810145 100644
+--- a/listener/src/sourceAdapter/evmAdapter.ts
++++ b/listener/src/sourceAdapter/evmAdapter.ts
+@@ -13,6 +13,7 @@ import {
+   SENDER_CONTRACT_ADDRESS,
+   POLL_INTERVAL_MS,
+   CONFIRMATIONS,
++  START_BLOCK,
+ } from "../config";
+ 
+ const log = childLogger("evmAdapter");
+@@ -47,7 +48,9 @@ export class EvmSourceAdapter {
+     }
+ 
+     this.contract = new ethers.Contract(SENDER_CONTRACT_ADDRESS, SENDER_ABI, this.provider);
+-    this.lastProcessedBlock = await this.provider.getBlockNumber() - 1;
++    // Replay from START_BLOCK so events emitted while this listener was down are not lost
++    // (safe: votes are idempotent per listener).
++    this.lastProcessedBlock = START_BLOCK - 1;
+     log.info({ address: SENDER_CONTRACT_ADDRESS, startBlock: this.lastProcessedBlock }, "SenderContract attached");
+   }
+ 
+diff --git a/listener/src/types.ts b/listener/src/types.ts
+index 121de41..07628b2 100644
+--- a/listener/src/types.ts
++++ b/listener/src/types.ts
+@@ -18,7 +18,8 @@ export type TxStatus =
+   | "TIMED_OUT"
+   | "REJECTED";
+ 
+-export type ListenerId = "A" | "B" | "C";
++export const LISTENER_IDS = ["A", "B", "C", "D"] as const;
++export type ListenerId = (typeof LISTENER_IDS)[number];
+ 
+ export type VoteValue = "APPROVE" | "REJECT";
+ 
+diff --git a/package.json b/package.json
+index b607955..26f34af 100644
+--- a/package.json
++++ b/package.json
+@@ -14,7 +14,7 @@
+     "deploy:local": "npx hardhat run scripts/deploy.ts --network localhost",
+     "node": "npx hardhat node",
+     "demo:send": "npx hardhat run scripts/sendTransaction.ts --network localhost",
+-    "listeners": "concurrently -k -n ListenerA,ListenerB,ListenerC -c magenta,darkMagenta,pink \"cd listener && npx cross-env LISTENER_ID=A npm run start\" \"cd listener && npx cross-env LISTENER_ID=B npm run start\" \"cd listener && npx cross-env LISTENER_ID=C npm run start\"",
++    "listeners": "concurrently -k -n ListenerA,ListenerB,ListenerC,ListenerD -c magenta,darkMagenta,pink,red \"cd listener && npx cross-env LISTENER_ID=A npm run start\" \"cd listener && npx cross-env LISTENER_ID=B npm run start\" \"cd listener && npx cross-env LISTENER_ID=C npm run start\" \"cd listener && npx cross-env LISTENER_ID=D npm run start\"",
+     "api": "cd listener && npm run api",
+     "start:all": "powershell -ExecutionPolicy Bypass -File ./start-all.ps1",
+     "dev": "concurrently -k -n Node,API,Dashboard -c magenta,darkMagenta,pink \"npm run node\" \"npm run api\" \"cd dashboard && npm run dev\""
+diff --git a/start-all.ps1 b/start-all.ps1
+index 47db089..9fb5f0b 100644
+--- a/start-all.ps1
++++ b/start-all.ps1
+@@ -4,7 +4,7 @@
+   Starts the Smart Listener local demo stack on Windows PowerShell.
+ 
+ .DESCRIPTION
+-  Launches Hardhat node, deploys contracts, API server, three listeners (A/B/C),
++  Launches Hardhat node, deploys contracts, API server, four listeners (A/B/C/D),
+   and the Vite dashboard. Errors are printed clearly. Press Ctrl+C to stop all.
+ 
+ .NOTES
+@@ -176,8 +176,9 @@ try {
+   Start-LoggedJob "listener-A" $listenerDir "set LISTENER_ID=A&& npx ts-node src/listenerProcess.ts"
+   Start-LoggedJob "listener-B" $listenerDir "set LISTENER_ID=B&& npx ts-node src/listenerProcess.ts"
+   Start-LoggedJob "listener-C" $listenerDir "set LISTENER_ID=C&& npx ts-node src/listenerProcess.ts"
++  Start-LoggedJob "listener-D" $listenerDir "set LISTENER_ID=D&& npx ts-node src/listenerProcess.ts"
+   Start-Sleep -Seconds 3
+-  Write-Ok "Listeners A/B/C launched (check logs/listener-*.out.log)"
++  Write-Ok "Listeners A/B/C/D launched (check logs/listener-*.out.log)"
+ 
+   # ── Dashboard ──────────────────────────────────────────────────────────────
+   $dashboardDir = Join-Path $Root "dashboard"
