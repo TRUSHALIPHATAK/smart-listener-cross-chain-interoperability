@@ -105,7 +105,7 @@ Important variables:
 | `SOURCE_RPC_URL` | `http://127.0.0.1:8545` | Source chain RPC |
 | `REQUIRED_VOTES` | `3` | Approvals needed (must be a strict majority) |
 | `TOTAL_LISTENERS` | `4` | Listener count (max 4: A–D) |
-| `DESTINATION_TYPE` | `simulated` | `simulated` or `fabric` (stub) |
+| `DESTINATION_TYPE` | `evm` | `evm` (real 2nd chain), `simulated`, or `fabric` (stub) |
 | `API_PORT` | `3001` | REST API port |
 | `DATABASE_URL` | *(unset)* | If set → PostgreSQL; else sql.js SQLite |
 | `SIMULATED_FAILURE_RATE` | `0.05` | Simulated dest failure probability |

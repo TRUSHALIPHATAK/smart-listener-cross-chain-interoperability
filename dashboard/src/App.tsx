@@ -403,6 +403,7 @@ export default function App() {
                       <th>Transaction ID</th>
                       <th>Destination</th>
                       <th>Status</th>
+                      <th>Destination tx</th>
                       <th>Votes</th>
                       <th>Error</th>
                     </tr>
@@ -415,13 +416,16 @@ export default function App() {
                         </td>
                         <td className="mono-cell">{tx.destinationAddress}</td>
                         <td><StatusBadge status={tx.status} /></td>
+                        <td className="mono-cell" title={tx.destTxHash}>
+                          {tx.destTxHash ? `${tx.destTxHash.slice(0, 12)}…` : "—"}
+                        </td>
                         <td>{tx.approveVotes ?? 0} approve / {tx.rejectVotes ?? 0} reject</td>
                         <td>{tx.errorMessage || "—"}</td>
                       </tr>
                     ))}
                     {!loading && visibleTransactions.length === 0 && (
                       <tr>
-                        <td colSpan={5} className="empty-state">No transactions found.</td>
+                        <td colSpan={6} className="empty-state">No transactions found.</td>
                       </tr>
                     )}
                   </tbody>

@@ -44,7 +44,7 @@ export const CONFIRMATIONS      = optionalInt("CONFIRMATIONS", 1);
 
 // ── Contract Addresses ────────────────────────────────────────────────────────
 
-function loadDeployment(): { SenderContract: string; ReceiverMock: string } {
+function loadDeployment(): { SenderContract: string; ReceiverMock: string; DestinationReceiver?: string } {
   const deployPath = path.join(__dirname, "..", "config", "deployment.json");
   if (fs.existsSync(deployPath)) {
     const data = JSON.parse(fs.readFileSync(deployPath, "utf8"));
@@ -54,6 +54,7 @@ function loadDeployment(): { SenderContract: string; ReceiverMock: string } {
   return {
     SenderContract: optional("SENDER_CONTRACT_ADDRESS", ""),
     ReceiverMock:   optional("RECEIVER_MOCK_ADDRESS",   ""),
+    DestinationReceiver: optional("DESTINATION_RECEIVER_ADDRESS", ""),
   };
 }
 
@@ -97,11 +98,17 @@ export const SQLITE_PATH        = optional("SQLITE_PATH", path.join(__dirname, "
 // ── Destination ───────────────────────────────────────────────────────────────
 
 /**
- * DESTINATION_TYPE: "simulated" | "fabric"
- * "simulated" = local ReceiverMock (default for dev)
- * "fabric"    = Hyperledger Fabric adapter (requires Fabric env vars)
+ * DESTINATION_TYPE: "evm" | "simulated" | "fabric"
+ * "evm"       = real second chain + DestinationReceiver contract (default)
+ * "simulated" = fake adapter with random latency/failures
+ * "fabric"    = Hyperledger Fabric adapter (stub)
  */
-export const DESTINATION_TYPE   = optional("DESTINATION_TYPE", "simulated") as "simulated" | "fabric";
+export const DESTINATION_TYPE   = optional("DESTINATION_TYPE", "evm") as "evm" | "simulated" | "fabric";
+export const DEST_RPC_URL       = optional("DEST_RPC_URL", "http://127.0.0.1:8546");
+export const DESTINATION_RECEIVER_ADDRESS: string =
+  process.env.DESTINATION_RECEIVER_ADDRESS ?? deployment.DestinationReceiver ?? "";
+/** Local-demo only: Hardhat's public test mnemonic. Listener A..D use accounts #1..#4. */
+export const EXECUTOR_MNEMONIC  = optional("EXECUTOR_MNEMONIC", "test test test test test test test test test test test junk");
 
 // Fabric (only used when DESTINATION_TYPE=fabric)
 export const FABRIC_CHANNEL     = optional("FABRIC_CHANNEL", "mychannel");
@@ -127,7 +134,7 @@ export function printConfig() {
   console.log(`  Listener ID:        ${LISTENER_ID}`);
   console.log(`  Source RPC:         ${SOURCE_RPC_URL}`);
   console.log(`  SenderContract:     ${SENDER_CONTRACT_ADDRESS || "(not set)"}`);
-  console.log(`  Destination type:   ${DESTINATION_TYPE}`);
+  console.log(`  Destination type:   ${DESTINATION_TYPE}${DESTINATION_TYPE === "evm" ? ` @ ${DEST_RPC_URL}` : ""}`);
   console.log(`  DB:                 ${DATABASE_URL ? "PostgreSQL" : `SQLite (sql.js) @ ${SQLITE_PATH}`}`);
   console.log(`  Required votes:     ${REQUIRED_VOTES}/${TOTAL_LISTENERS}`);
   console.log(`  TX timeout:         ${TX_TIMEOUT_MS}ms`);

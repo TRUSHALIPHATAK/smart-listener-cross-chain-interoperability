@@ -1,227 +1,251 @@
-#Requires -Version 5.1
-<#
-.SYNOPSIS
-  Starts the Smart Listener local demo stack on Windows PowerShell.
-
-.DESCRIPTION
-  Launches Hardhat node, deploys contracts, API server, four listeners (A/B/C/D),
-  and the Vite dashboard. Errors are printed clearly. Press Ctrl+C to stop all.
-
-.NOTES
-  Does not require Docker, Ubuntu, or Visual Studio C++ build tools.
-  Storage uses sql.js (pure WASM SQLite).
-#>
+﻿#Requires -Version 5.1
+# Smart Listener - one-command local launcher (Windows PowerShell 5.1+)
+# ASCII only, no command chaining operators, no nested quotes.
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 Set-Location $Root
 
+$script:jobs = @()
+$q = [char]34
+
 function Write-Step([string]$Message) {
-  Write-Host ""
-  Write-Host "==> $Message" -ForegroundColor Magenta
+    Write-Host ""
+    Write-Host "==> $Message" -ForegroundColor Magenta
 }
 
 function Write-Ok([string]$Message) {
-  Write-Host "    OK  $Message" -ForegroundColor DarkMagenta
+    Write-Host "    OK    $Message" -ForegroundColor Green
+}
+
+function Write-Warn([string]$Message) {
+    Write-Host "    NOTE  $Message" -ForegroundColor Yellow
 }
 
 function Write-Fail([string]$Message) {
-  Write-Host "    FAIL  $Message" -ForegroundColor DarkRed
+    Write-Host "    FAIL  $Message" -ForegroundColor Red
 }
 
 function Test-PortOpen([int]$Port) {
-  try {
-    $c = New-Object System.Net.Sockets.TcpClient
-    $c.Connect("127.0.0.1", $Port)
-    $c.Close()
-    return $true
-  } catch {
-    return $false
-  }
-}
-
-function Wait-Port([int]$Port, [int]$TimeoutSec = 60, [string]$Label = "service") {
-  $deadline = (Get-Date).AddSeconds($TimeoutSec)
-  while ((Get-Date) -lt $deadline) {
-    if (Test-PortOpen $Port) {
-      Write-Ok "$Label is listening on port $Port"
-      return
-    }
-    Start-Sleep -Milliseconds 500
-  }
-  throw "$Label did not open port $Port within ${TimeoutSec}s"
-}
-
-function Wait-HttpOk([string]$Url, [int]$TimeoutSec = 45) {
-  $deadline = (Get-Date).AddSeconds($TimeoutSec)
-  while ((Get-Date) -lt $deadline) {
+    $client = New-Object System.Net.Sockets.TcpClient
     try {
-      $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 2
-      if ($r.StatusCode -eq 200) {
-        Write-Ok "HTTP $Url → 200"
-        return
-      }
-    } catch {
-      Start-Sleep -Milliseconds 500
+        $client.Connect("127.0.0.1", $Port)
+        return $true
     }
-  }
-  throw "Timed out waiting for $Url"
+    catch {
+        return $false
+    }
+    finally {
+        $client.Close()
+    }
 }
 
-$jobs = @()
+function Wait-Port([int]$Port, [int]$TimeoutSec, [string]$Label) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-PortOpen $Port) {
+            Write-Ok "$Label is listening on port $Port"
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "$Label did not open port $Port within $TimeoutSec seconds"
+}
 
-function Start-LoggedJob([string]$Name, [string]$WorkingDirectory, [string]$CmdLine) {
-  Write-Step "Starting $Name"
-  $logDir = Join-Path $Root "logs"
-  New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-  $stdout = Join-Path $logDir "$Name.out.log"
-  $stderr = Join-Path $logDir "$Name.err.log"
+function Wait-HttpOk([string]$Url, [int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
+            if ($response.StatusCode -eq 200) {
+                Write-Ok "Health check passed: $Url"
+                return
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 700
+        }
+    }
+    throw "Timed out waiting for $Url"
+}
 
-  # Use cmd.exe so npx.cmd resolves correctly on Windows
-  $p = Start-Process -FilePath "cmd.exe" `
-    -ArgumentList "/c", "$CmdLine > `"$stdout`" 2> `"$stderr`"" `
-    -WorkingDirectory $WorkingDirectory `
-    -PassThru -WindowStyle Hidden
+function Start-LoggedJob {
+    param(
+        [string]$Name,
+        [string]$WorkingDirectory,
+        [string]$CmdLine,
+        [hashtable]$EnvVars = @{}
+    )
 
-  $script:jobs += [pscustomobject]@{ Name = $Name; Process = $p; Out = $stdout; Err = $stderr }
-  Write-Ok "$Name started (PID $($p.Id)) — logs: logs\$Name.*.log"
-  return $p
+    Write-Step "Starting $Name"
+
+    $logDir = Join-Path $Root "logs"
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+    $stdout = Join-Path $logDir ($Name + ".out.log")
+    $stderr = Join-Path $logDir ($Name + ".err.log")
+
+    # cmd.exe is used so Windows npx.cmd works; output goes to log files.
+    $fullCommand = $CmdLine + " 1> " + $q + $stdout + $q + " 2> " + $q + $stderr + $q
+    $cmdArgs = "/d /s /c " + $q + $fullCommand + $q
+
+    # Per-process environment (e.g. LISTENER_ID) - the child inherits it.
+    $previous = @{}
+    foreach ($key in $EnvVars.Keys) {
+        $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, [string]$EnvVars[$key], "Process")
+    }
+
+    try {
+        $process = Start-Process -FilePath $env:ComSpec `
+            -ArgumentList $cmdArgs `
+            -WorkingDirectory $WorkingDirectory `
+            -PassThru `
+            -WindowStyle Hidden
+    }
+    finally {
+        foreach ($key in $EnvVars.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $previous[$key], "Process")
+        }
+    }
+
+    $script:jobs += [pscustomobject]@{
+        Name    = $Name
+        Process = $process
+        Out     = $stdout
+        Err     = $stderr
+    }
+
+    Write-Ok "$Name launched (PID $($process.Id))"
 }
 
 function Stop-AllJobs {
-  Write-Step "Stopping all services"
-  foreach ($j in $jobs) {
-    try {
-      if ($j.Process -and -not $j.Process.HasExited) {
-        Stop-Process -Id $j.Process.Id -Force -ErrorAction SilentlyContinue
-        # Also stop child node processes spawned by this window if needed
-        Write-Ok "Stopped $($j.Name)"
-      }
-    } catch {
-      Write-Fail "Could not stop $($j.Name): $_"
+    foreach ($job in $script:jobs) {
+        try {
+            # /T kills the whole process tree (cmd -> npx -> node) so ports are freed.
+            & cmd.exe /c "taskkill /PID $($job.Process.Id) /T /F >nul 2>&1"
+            Write-Host "Stopped $($job.Name)"
+        }
+        catch {
+            # keep stopping the others
+        }
     }
-  }
-  # Best-effort: free common ports by stopping node processes that hold them
-  foreach ($port in 8545, 3001, 5173) {
-    try {
-      $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
-        Where-Object { $_.State -eq "Listen" }
-      foreach ($c in $conns) {
-        Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue
-      }
-    } catch { }
-  }
-}
-
-# ── Preflight ────────────────────────────────────────────────────────────────
-
-Write-Step "Preflight checks"
-if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Fail "Node.js is not installed or not on PATH"
-  exit 1
-}
-if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-  Write-Fail "npm is not installed or not on PATH"
-  exit 1
-}
-Write-Ok "Node $(node -v) / npm $(npm -v)"
-
-if (-not (Test-Path (Join-Path $Root "node_modules"))) {
-  Write-Step "Installing dependencies (npm install)"
-  npm install
-  if ($LASTEXITCODE -ne 0) { Write-Fail "npm install failed"; exit 1 }
-  Write-Ok "Dependencies installed"
-}
-
-# Copy .env.example → .env if missing
-$envFile = Join-Path $Root ".env"
-$envExample = Join-Path $Root ".env.example"
-if (-not (Test-Path $envFile) -and (Test-Path $envExample)) {
-  Copy-Item $envExample $envFile
-  Write-Ok "Created .env from .env.example"
-}
-
-# Stop anything already bound to our ports
-foreach ($port in 8545, 3001, 5173) {
-  if (Test-PortOpen $port) {
-    Write-Host "    Port $port is in use — attempting to free it..." -ForegroundColor DarkMagenta
-    try {
-      $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue |
-        Where-Object { $_.State -eq "Listen" }
-      foreach ($c in $conns) {
-        Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue
-      }
-    } catch { }
-    Start-Sleep -Seconds 1
-  }
 }
 
 try {
-  # ── Hardhat node ───────────────────────────────────────────────────────────
-  Start-LoggedJob "hardhat-node" $Root "npx hardhat node"
-  Wait-Port 8545 90 "Hardhat node"
+    Write-Step "Preflight checks"
 
-  # ── Deploy ─────────────────────────────────────────────────────────────────
-  Write-Step "Deploying contracts to localhost"
-  npx hardhat run scripts/deploy.ts --network localhost
-  if ($LASTEXITCODE -ne 0) { throw "Contract deployment failed (exit $LASTEXITCODE)" }
-  Write-Ok "Contracts deployed — see deployments/localhost.json"
-
-  # ── API ────────────────────────────────────────────────────────────────────
-  $listenerDir = Join-Path $Root "listener"
-  Start-LoggedJob "api" $listenerDir "npx ts-node src/apiServer.ts"
-  Wait-HttpOk "http://127.0.0.1:3001/api/health" 60
-
-  # ── Listeners ──────────────────────────────────────────────────────────────
-  Start-LoggedJob "listener-A" $listenerDir "set LISTENER_ID=A&& npx ts-node src/listenerProcess.ts"
-  Start-LoggedJob "listener-B" $listenerDir "set LISTENER_ID=B&& npx ts-node src/listenerProcess.ts"
-  Start-LoggedJob "listener-C" $listenerDir "set LISTENER_ID=C&& npx ts-node src/listenerProcess.ts"
-  Start-LoggedJob "listener-D" $listenerDir "set LISTENER_ID=D&& npx ts-node src/listenerProcess.ts"
-  Start-Sleep -Seconds 3
-  Write-Ok "Listeners A/B/C/D launched (check logs/listener-*.out.log)"
-
-  # ── Dashboard ──────────────────────────────────────────────────────────────
-  $dashboardDir = Join-Path $Root "dashboard"
-  Start-LoggedJob "dashboard" $dashboardDir "npx vite --host 127.0.0.1 --port 5173"
-  Wait-Port 5173 60 "Dashboard"
-
-  Write-Host ""
-  Write-Host "========================================================" -ForegroundColor Magenta
-  Write-Host "  Smart Listener stack is running" -ForegroundColor Magenta
-  Write-Host "========================================================" -ForegroundColor Magenta
-  Write-Host "  Dashboard:   http://127.0.0.1:5173"
-  Write-Host "  API health:  http://127.0.0.1:3001/api/health"
-  Write-Host "  Hardhat RPC: http://127.0.0.1:8545"
-  Write-Host ""
-  Write-Host "  Send a test request (new PowerShell window):"
-  Write-Host "    cd $Root"
-  Write-Host "    npm run demo:send"
-  Write-Host ""
-  Write-Host "  Logs: $Root\logs\"
-  Write-Host "  Press Ctrl+C to stop all services."
-  Write-Host "========================================================" -ForegroundColor Magenta
-  Write-Host ""
-
-  # Keep script alive until Ctrl+C; watch for crashed children
-  while ($true) {
-    foreach ($j in $jobs) {
-      if ($j.Process.HasExited) {
-        Write-Fail "$($j.Name) exited unexpectedly (code $($j.Process.ExitCode))"
-        if (Test-Path $j.Err) {
-          Write-Host "---- last lines of $($j.Err) ----" -ForegroundColor DarkRed
-          Get-Content $j.Err -Tail 20 -ErrorAction SilentlyContinue
-        }
-        throw "$($j.Name) crashed — see logs above"
-      }
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw "Node.js is not installed or not on PATH."
     }
-    Start-Sleep -Seconds 2
-  }
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        throw "npm is not installed or not on PATH."
+    }
+    Write-Ok "Node $(node -v) / npm $(npm -v)"
+
+    foreach ($port in @(8545, 8546, 3001, 5173)) {
+        if (Test-PortOpen $port) {
+            throw "Port $port is already in use. A previous run is still alive. Run: taskkill /IM node.exe /F   then start again."
+        }
+    }
+    Write-Ok "Ports 8545, 8546, 3001, 5173 are free"
+
+    if (-not (Test-Path (Join-Path $Root "node_modules"))) {
+        Write-Step "Installing dependencies"
+        npm install
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm install failed."
+        }
+    }
+
+    # .env: create if missing, then make sure the 4-listener settings are correct.
+    $envFile = Join-Path $Root ".env"
+    $envExample = Join-Path $Root ".env.example"
+
+    if ((-not (Test-Path $envFile)) -and (Test-Path $envExample)) {
+        Copy-Item $envExample $envFile
+        Write-Ok "Created .env from .env.example"
+    }
+
+    if (Test-Path $envFile) {
+        $original = [System.IO.File]::ReadAllText($envFile)
+        $text = $original
+        $text = [regex]::Replace($text, '(?m)^[ \t]*REQUIRED_VOTES[ \t]*=[^\r\n]*', 'REQUIRED_VOTES=3')
+        $text = [regex]::Replace($text, '(?m)^[ \t]*TOTAL_LISTENERS[ \t]*=[^\r\n]*', 'TOTAL_LISTENERS=4')
+        $text = [regex]::Replace($text, '(?m)^[ \t]*API_HOST[ \t]*=[^\r\n]*', 'API_HOST=127.0.0.1')
+        $text = [regex]::Replace($text, '(?m)^[ \t]*DESTINATION_TYPE[ \t]*=[^\r\n]*', 'DESTINATION_TYPE=evm')
+        if ($text -ne $original) {
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            [System.IO.File]::WriteAllText($envFile, $text, $utf8NoBom)
+            Write-Warn "Updated .env: REQUIRED_VOTES=3, TOTAL_LISTENERS=4, API_HOST=127.0.0.1, DESTINATION_TYPE=evm"
+        }
+    }
+
+    # 1. Source chain (8545) and destination chain (8546, chainId 31338)
+    Start-LoggedJob "hardhat-source" $Root "npx hardhat node"
+    Wait-Port 8545 90 "Source chain"
+    Start-LoggedJob "hardhat-dest" $Root "npx hardhat node --port 8546" @{ HARDHAT_CHAIN_ID = "31338" }
+    Wait-Port 8546 90 "Destination chain"
+
+    # 2. Deploy contracts (source first, then destination merges into the same deployment file)
+    Write-Step "Deploying SenderContract on the source chain"
+    npx hardhat run scripts/deploy.ts --network localhost
+    if ($LASTEXITCODE -ne 0) {
+        throw "Source deployment failed."
+    }
+    Write-Step "Deploying DestinationReceiver on the destination chain"
+    npx hardhat run scripts/deployDestination.ts --network destination
+    if ($LASTEXITCODE -ne 0) {
+        throw "Destination deployment failed."
+    }
+    Write-Ok "Contracts deployed on both chains"
+
+    # 3. API
+    $listenerDir = Join-Path $Root "listener"
+    Start-LoggedJob "api" $listenerDir "npx ts-node src/apiServer.ts"
+    Wait-HttpOk "http://127.0.0.1:3001/api/health" 90
+
+    # 4. Four listeners (ID passed through the environment, not the command line)
+    foreach ($id in @("A", "B", "C", "D")) {
+        Start-LoggedJob ("listener-" + $id) $listenerDir "npx ts-node src/listenerProcess.ts" @{ LISTENER_ID = $id }
+    }
+    Start-Sleep -Seconds 4
+
+    # 5. Dashboard
+    $dashboardDir = Join-Path $Root "dashboard"
+    Start-LoggedJob "dashboard" $dashboardDir "npx vite --host 127.0.0.1 --port 5173"
+    Wait-Port 5173 60 "Dashboard"
+
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Magenta
+    Write-Host " Smart Listener demo stack is running" -ForegroundColor Magenta
+    Write-Host "============================================" -ForegroundColor Magenta
+    Write-Host "Dashboard:   http://127.0.0.1:5173"
+    Write-Host "API health:  http://127.0.0.1:3001/api/health"
+    Write-Host "Source RPC:  http://127.0.0.1:8545"
+    Write-Host "Dest RPC:    http://127.0.0.1:8546"
+    Write-Host "Logs:        $Root\logs"
+    Write-Host ""
+    Write-Host "Send a test tx in another window:  npm run demo:send"
+    Write-Host "Press Ctrl+C here to stop everything."
+
+    while ($true) {
+        foreach ($job in $script:jobs) {
+            if ($job.Process.HasExited) {
+                Write-Fail "$($job.Name) exited with code $($job.Process.ExitCode)"
+                if (Test-Path $job.Err) { Get-Content $job.Err -Tail 20 }
+                if (Test-Path $job.Out) { Get-Content $job.Out -Tail 10 }
+                throw "$($job.Name) stopped unexpectedly."
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
 }
 catch {
-  Write-Fail $_.Exception.Message
-  Stop-AllJobs
-  exit 1
+    Write-Fail $_.Exception.Message
+    Write-Host "Check the logs folder for details."
+    exit 1
 }
 finally {
-  Stop-AllJobs
+    Stop-AllJobs
 }

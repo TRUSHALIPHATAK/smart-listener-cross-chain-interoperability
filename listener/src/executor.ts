@@ -13,6 +13,7 @@ import { CrossChainTransaction, DestinationResult } from "./types";
 import { DbAdapter } from "./db";
 import { simulatedExecute } from "./destinationAdapter/simulatedAdapter";
 import { fabricExecute } from "./destinationAdapter/fabricAdapter";
+import { evmExecute } from "./destinationAdapter/evmDestinationAdapter";
 import { childLogger } from "./logger";
 import { DESTINATION_TYPE, MAX_RETRIES, RETRY_BACKOFF_MS } from "./config";
 
@@ -39,7 +40,10 @@ export async function executeTransaction(
   log.info({ txId: tx.txId, destination: DESTINATION_TYPE }, "Beginning execution");
 
   // ── Select destination adapter ─────────────────────────────────────────────
-  const executeFn = DESTINATION_TYPE === "fabric" ? fabricExecute : simulatedExecute;
+  const executeFn =
+    DESTINATION_TYPE === "fabric" ? fabricExecute :
+    DESTINATION_TYPE === "evm"    ? evmExecute    :
+    simulatedExecute;
 
   // ── Retry loop ─────────────────────────────────────────────────────────────
   let lastResult: DestinationResult = { success: false };

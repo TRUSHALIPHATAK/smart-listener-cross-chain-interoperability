@@ -16,7 +16,7 @@ const config: HardhatUserConfig = {
   },
   networks: {
     hardhat: {
-      chainId: 31337,
+      chainId: Number(process.env.HARDHAT_CHAIN_ID || 31337),
       mining: {
         auto: true,
         interval: 0,
@@ -25,6 +25,11 @@ const config: HardhatUserConfig = {
     localhost: {
       url: process.env.HARDHAT_RPC_URL || "http://127.0.0.1:8545",
       chainId: 31337,
+    },
+    // Destination chain (second local node: HARDHAT_CHAIN_ID=31338 npx hardhat node --port 8546)
+    destination: {
+      url: process.env.DEST_RPC_URL || "http://127.0.0.1:8546",
+      chainId: 31338,
     },
     // Add additional EVM networks here via env vars:
     // sepolia: {
