@@ -1,13 +1,12 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 # Smart Listener - one-command local launcher (Windows PowerShell 5.1+)
-# ASCII only, no command chaining operators, no nested quotes.
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 Set-Location $Root
 
 $script:jobs = @()
-$q = [char]34
+$script:stopping = $false
 
 function Write-Step([string]$Message) {
     Write-Host ""
@@ -26,70 +25,97 @@ function Write-Fail([string]$Message) {
     Write-Host "    FAIL  $Message" -ForegroundColor Red
 }
 
-function Test-PortOpen([int]$Port) {
-    $client = New-Object System.Net.Sockets.TcpClient
-    try {
-        $client.Connect("127.0.0.1", $Port)
-        return $true
+function Get-ProjectCommand([string]$RelativePath, [string]$Label) {
+    $command = Join-Path $Root $RelativePath
+    if (-not (Test-Path $command)) {
+        throw "$Label is missing at $command. Run npm install first."
     }
-    catch {
-        return $false
+    return $command
+}
+
+function Get-EnvFileValue([string]$Name, [string]$Fallback) {
+    $envFile = Join-Path $Root ".env"
+    if (-not (Test-Path $envFile)) {
+        return $Fallback
     }
-    finally {
-        $client.Close()
+    $line = Get-Content $envFile | Where-Object {
+        $_ -match "^[\s]*$([regex]::Escape($Name))[\s]*="
+    } | Select-Object -Last 1
+    if (-not $line) {
+        return $Fallback
+    }
+    return (($line -split "=", 2)[1]).Trim().Trim('"')
+}
+
+function Get-ListeningPortOwner([int]$Port) {
+    $connections = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    foreach ($connection in $connections) {
+        $process = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            Port = $Port
+            PID = $connection.OwningProcess
+            Process = if ($process) { $process.ProcessName } else { "unknown" }
+        }
     }
 }
 
-function Wait-Port([int]$Port, [int]$TimeoutSec, [string]$Label) {
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        if (Test-PortOpen $Port) {
-            Write-Ok "$Label is listening on port $Port"
-            return
-        }
-        Start-Sleep -Milliseconds 500
+function Assert-PortsFree([int[]]$Ports) {
+    $occupied = @()
+    foreach ($port in $Ports) {
+        $occupied += @(Get-ListeningPortOwner $port)
     }
-    throw "$Label did not open port $Port within $TimeoutSec seconds"
+    if ($occupied.Count -gt 0) {
+        $details = ($occupied | ForEach-Object {
+            "port $($_.Port) is occupied by $($_.Process) (PID $($_.PID))"
+        }) -join "; "
+        throw "Required port(s) are already in use: $details. Stop that specific process or choose another port."
+    }
+    Write-Ok ("Ports {0} are free" -f ($Ports -join ", "))
 }
 
-function Wait-HttpOk([string]$Url, [int]$TimeoutSec) {
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
-            if ($response.StatusCode -eq 200) {
-                Write-Ok "Health check passed: $Url"
-                return
-            }
-        }
-        catch {
-            Start-Sleep -Milliseconds 700
-        }
-    }
-    throw "Timed out waiting for $Url"
+function Get-ListenerProcessIds {
+    $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.CommandLine -and
+        $_.CommandLine -match "listenerProcess\.ts" -and
+        $_.CommandLine -match [regex]::Escape($Root)
+    })
+    return $processes | Select-Object -ExpandProperty ProcessId
 }
 
-function Start-LoggedJob {
+function Assert-NoDuplicateListeners {
+    $ids = @(Get-ListenerProcessIds)
+    if ($ids.Count -gt 0) {
+        throw "Listener processes are already running (PID(s): $($ids -join ', ')). Stop those specific processes before starting the launcher again."
+    }
+}
+
+function Test-ProcessAlive($Job) {
+    if ($Job.Process.HasExited) {
+        $errorTail = if (Test-Path $Job.Err) { (Get-Content $Job.Err -Tail 20) -join [Environment]::NewLine } else { "" }
+        $outputTail = if (Test-Path $Job.Out) { (Get-Content $Job.Out -Tail 20) -join [Environment]::NewLine } else { "" }
+        $diagnostic = @($errorTail, $outputTail) | Where-Object { $_ } | Out-String
+        throw "$($Job.Name) exited with code $($Job.Process.ExitCode).`n$diagnostic"
+    }
+}
+
+function Start-LoggedProcess {
     param(
         [string]$Name,
         [string]$WorkingDirectory,
-        [string]$CmdLine,
+        [string]$FilePath,
+        [string[]]$Arguments,
         [hashtable]$EnvVars = @{}
     )
 
     Write-Step "Starting $Name"
-
     $logDir = Join-Path $Root "logs"
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-
     $stdout = Join-Path $logDir ($Name + ".out.log")
     $stderr = Join-Path $logDir ($Name + ".err.log")
 
-    # cmd.exe is used so Windows npx.cmd works; output goes to log files.
-    $fullCommand = $CmdLine + " 1> " + $q + $stdout + $q + " 2> " + $q + $stderr + $q
-    $cmdArgs = "/d /s /c " + $q + $fullCommand + $q
+    if (Test-Path $stdout) { Clear-Content $stdout }
+    if (Test-Path $stderr) { Clear-Content $stderr }
 
-    # Per-process environment (e.g. LISTENER_ID) - the child inherits it.
     $previous = @{}
     foreach ($key in $EnvVars.Keys) {
         $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
@@ -97,9 +123,11 @@ function Start-LoggedJob {
     }
 
     try {
-        $process = Start-Process -FilePath $env:ComSpec `
-            -ArgumentList $cmdArgs `
+        $process = Start-Process -FilePath $FilePath `
+            -ArgumentList $Arguments `
             -WorkingDirectory $WorkingDirectory `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
             -PassThru `
             -WindowStyle Hidden
     }
@@ -109,112 +137,193 @@ function Start-LoggedJob {
         }
     }
 
-    $script:jobs += [pscustomobject]@{
-        Name    = $Name
+    $job = [pscustomobject]@{
+        Name = $Name
         Process = $process
-        Out     = $stdout
-        Err     = $stderr
+        Out = $stdout
+        Err = $stderr
     }
+    $script:jobs += $job
+    Write-Ok "$Name started (PID $($process.Id)); logs: $stdout and $stderr"
+    return $job
+}
 
-    Write-Ok "$Name launched (PID $($process.Id))"
+function Wait-JsonRpc([string]$Url, [int]$ExpectedChainId, [int]$TimeoutSec, [string]$Label, $Job) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $body = '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+    while ((Get-Date) -lt $deadline) {
+        Test-ProcessAlive $Job
+        try {
+            $response = Invoke-RestMethod -Uri $Url -Method Post -ContentType "application/json" -Body $body -TimeoutSec 3
+            $chainId = [Convert]::ToInt32($response.result.Substring(2), 16)
+            if ($chainId -eq $ExpectedChainId) {
+                Write-Ok "$Label JSON-RPC is ready at $Url (chain ID $chainId)"
+                return
+            }
+            throw "returned unexpected chain ID $chainId"
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    throw "$Label did not become ready within $TimeoutSec seconds. Last error: $lastError"
+}
+
+function Wait-HttpOk([string]$Url, [int]$TimeoutSec, [string]$Label, $Job) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        Test-ProcessAlive $Job
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
+            if ($response.StatusCode -eq 200) {
+                Write-Ok "$Label is ready at $Url"
+                return
+            }
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "$Label did not become ready within $TimeoutSec seconds. Last error: $lastError"
+}
+
+function Wait-Listeners([string]$Url, [string[]]$ExpectedIds, [int]$TimeoutSec, $Jobs) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        foreach ($job in $Jobs) { Test-ProcessAlive $job }
+        try {
+            $data = Invoke-RestMethod -Uri $Url -UseBasicParsing -TimeoutSec 3
+            $recent = @{}
+            foreach ($listener in @($data.listeners)) {
+                if (([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$listener.lastSeenAt) -lt 30000) {
+                    $recent[$listener.listenerId] = $listener
+                }
+            }
+            $missing = @($ExpectedIds | Where-Object { -not $recent.ContainsKey($_) })
+            if ($missing.Count -eq 0) {
+                $status = ($ExpectedIds | ForEach-Object {
+                    "$_ connected=$($recent[$_].sourceChainConnected)"
+                }) -join ", "
+                Write-Ok "Listener heartbeats received: $status"
+                return
+            }
+            $lastError = "waiting for listener(s): $($missing -join ', ')"
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    throw "Listeners did not register within $TimeoutSec seconds. Last error: $lastError"
+}
+
+function Get-DescendantProcessIds([int]$RootPid) {
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $ids = New-Object System.Collections.Generic.List[int]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootPid)
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+        foreach ($child in @($all | Where-Object { $_.ParentProcessId -eq $parent })) {
+            if (-not $ids.Contains([int]$child.ProcessId)) {
+                $ids.Add([int]$child.ProcessId)
+                $queue.Enqueue([int]$child.ProcessId)
+            }
+        }
+    }
+    return $ids
+}
+
+function Stop-ProcessTree([int]$RootPid) {
+    $descendants = @(Get-DescendantProcessIds $RootPid)
+    [array]::Reverse($descendants)
+    foreach ($pid in $descendants) {
+        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
 }
 
 function Stop-AllJobs {
-    foreach ($job in $script:jobs) {
-        try {
-            # /T kills the whole process tree (cmd -> npx -> node) so ports are freed.
-            & cmd.exe /c "taskkill /PID $($job.Process.Id) /T /F >nul 2>&1"
+    if ($script:stopping) { return }
+    $script:stopping = $true
+    foreach ($job in @($script:jobs | Sort-Object -Property Name -Descending)) {
+        if ($job.Process -and -not $job.Process.HasExited) {
+            Stop-ProcessTree $job.Process.Id
             Write-Host "Stopped $($job.Name)"
-        }
-        catch {
-            # keep stopping the others
         }
     }
 }
 
 try {
     Write-Step "Preflight checks"
-
-    if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-        throw "Node.js is not installed or not on PATH."
-    }
-    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-        throw "npm is not installed or not on PATH."
-    }
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw "Node.js is not installed or not on PATH." }
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) { throw "npm is not installed or not on PATH." }
     Write-Ok "Node $(node -v) / npm $(npm -v)"
 
-    foreach ($port in @(8545, 8546, 3001, 5173)) {
-        if (Test-PortOpen $port) {
-            throw "Port $port is already in use. A previous run is still alive. Run: taskkill /IM node.exe /F   then start again."
-        }
-    }
-    Write-Ok "Ports 8545, 8546, 3001, 5173 are free"
-
     if (-not (Test-Path (Join-Path $Root "node_modules"))) {
-        Write-Step "Installing dependencies"
-        npm install
-        if ($LASTEXITCODE -ne 0) {
-            throw "npm install failed."
-        }
+        throw "Dependencies are missing. Run npm install before npm run dev."
     }
+    $hardhat = Get-ProjectCommand "node_modules\.bin\hardhat.cmd" "Hardhat"
+    $tsNode = Get-ProjectCommand "node_modules\.bin\ts-node.cmd" "listener ts-node"
+    $vite = Get-ProjectCommand "node_modules\.bin\vite.cmd" "dashboard Vite"
+    $destinationType = Get-EnvFileValue "DESTINATION_TYPE" "evm"
+    $ports = @(8545, 3001, 5173)
+    if ($destinationType -eq "evm") { $ports += 8546 }
+    Assert-PortsFree $ports
+    Assert-NoDuplicateListeners
 
-    # .env: create if missing, then make sure the 4-listener settings are correct.
     $envFile = Join-Path $Root ".env"
-    $envExample = Join-Path $Root ".env.example"
-
-    if ((-not (Test-Path $envFile)) -and (Test-Path $envExample)) {
-        Copy-Item $envExample $envFile
+    if (-not (Test-Path $envFile) -and (Test-Path (Join-Path $Root ".env.example"))) {
+        Copy-Item (Join-Path $Root ".env.example") $envFile
         Write-Ok "Created .env from .env.example"
+        $destinationType = Get-EnvFileValue "DESTINATION_TYPE" "evm"
     }
 
-    if (Test-Path $envFile) {
-        $original = [System.IO.File]::ReadAllText($envFile)
-        $text = $original
-        $text = [regex]::Replace($text, '(?m)^[ \t]*REQUIRED_VOTES[ \t]*=[^\r\n]*', 'REQUIRED_VOTES=3')
-        $text = [regex]::Replace($text, '(?m)^[ \t]*TOTAL_LISTENERS[ \t]*=[^\r\n]*', 'TOTAL_LISTENERS=4')
-        $text = [regex]::Replace($text, '(?m)^[ \t]*API_HOST[ \t]*=[^\r\n]*', 'API_HOST=127.0.0.1')
-        $text = [regex]::Replace($text, '(?m)^[ \t]*DESTINATION_TYPE[ \t]*=[^\r\n]*', 'DESTINATION_TYPE=evm')
-        if ($text -ne $original) {
-            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-            [System.IO.File]::WriteAllText($envFile, $text, $utf8NoBom)
-            Write-Warn "Updated .env: REQUIRED_VOTES=3, TOTAL_LISTENERS=4, API_HOST=127.0.0.1, DESTINATION_TYPE=evm"
-        }
+    $sourceJob = Start-LoggedProcess "hardhat-source" $Root $hardhat @("node")
+    Wait-JsonRpc "http://127.0.0.1:8545" 31337 90 "Source chain" $sourceJob
+
+    $destinationJob = $null
+    if ($destinationType -eq "evm") {
+        $destinationJob = Start-LoggedProcess "hardhat-dest" $Root $hardhat @("node", "--port", "8546") @{ HARDHAT_CHAIN_ID = "31338" }
+        Wait-JsonRpc "http://127.0.0.1:8546" 31338 90 "Destination chain" $destinationJob
+    } else {
+        Write-Warn "DESTINATION_TYPE=$destinationType; destination Hardhat chain is not required."
     }
 
-    # 1. Source chain (8545) and destination chain (8546, chainId 31338)
-    Start-LoggedJob "hardhat-source" $Root "npx hardhat node"
-    Wait-Port 8545 90 "Source chain"
-    Start-LoggedJob "hardhat-dest" $Root "npx hardhat node --port 8546" @{ HARDHAT_CHAIN_ID = "31338" }
-    Wait-Port 8546 90 "Destination chain"
+    Write-Step "Deploying source contracts"
+    & $hardhat run (Join-Path $Root "scripts\deploy.ts") --network localhost
+    if ($LASTEXITCODE -ne 0) { throw "Source contract deployment failed with exit code $LASTEXITCODE." }
 
-    # 2. Deploy contracts (source first, then destination merges into the same deployment file)
-    Write-Step "Deploying SenderContract on the source chain"
-    npx hardhat run scripts/deploy.ts --network localhost
-    if ($LASTEXITCODE -ne 0) {
-        throw "Source deployment failed."
+    if ($destinationType -eq "evm") {
+        Write-Step "Deploying destination contracts"
+        & $hardhat run (Join-Path $Root "scripts\deployDestination.ts") --network destination
+        if ($LASTEXITCODE -ne 0) { throw "Destination contract deployment failed with exit code $LASTEXITCODE." }
     }
-    Write-Step "Deploying DestinationReceiver on the destination chain"
-    npx hardhat run scripts/deployDestination.ts --network destination
-    if ($LASTEXITCODE -ne 0) {
-        throw "Destination deployment failed."
-    }
-    Write-Ok "Contracts deployed on both chains"
 
-    # 3. API
+    $deploymentFile = Join-Path $Root "listener\config\deployment.json"
+    if (-not (Test-Path $deploymentFile)) { throw "Deployment completed without creating $deploymentFile." }
+    $deployment = Get-Content $deploymentFile -Raw | ConvertFrom-Json
+    if (-not $deployment.contracts.SenderContract) { throw "Deployment did not produce SenderContract address." }
+    Write-Ok "Contracts configured: SenderContract=$($deployment.contracts.SenderContract)"
+    if ($deployment.contracts.DestinationReceiver) {
+        Write-Ok "DestinationReceiver=$($deployment.contracts.DestinationReceiver)"
+    }
+
     $listenerDir = Join-Path $Root "listener"
-    Start-LoggedJob "api" $listenerDir "npx ts-node src/apiServer.ts"
-    Wait-HttpOk "http://127.0.0.1:3001/api/health" 90
+    $apiJob = Start-LoggedProcess "api" $listenerDir $tsNode @("src\apiServer.ts")
+    Wait-HttpOk "http://127.0.0.1:3001/api/health" 90 "API" $apiJob
 
-    # 4. Four listeners (ID passed through the environment, not the command line)
+    $listenerJobs = @()
     foreach ($id in @("A", "B", "C", "D")) {
-        Start-LoggedJob ("listener-" + $id) $listenerDir "npx ts-node src/listenerProcess.ts" @{ LISTENER_ID = $id }
+        $listenerJobs += Start-LoggedProcess ("listener-" + $id) $listenerDir $tsNode @("src\listenerProcess.ts") @{ LISTENER_ID = $id }
     }
-    Start-Sleep -Seconds 4
+    Wait-Listeners "http://127.0.0.1:3001/api/listeners" @("A", "B", "C", "D") 90 $listenerJobs
 
-    # 5. Dashboard
     $dashboardDir = Join-Path $Root "dashboard"
-    Start-LoggedJob "dashboard" $dashboardDir "npx vite --host 127.0.0.1 --port 5173"
-    Wait-Port 5173 60 "Dashboard"
+    $dashboardJob = Start-LoggedProcess "dashboard" $dashboardDir $vite @("--host", "127.0.0.1", "--port", "5173")
+    Wait-HttpOk "http://127.0.0.1:5173" 60 "Dashboard" $dashboardJob
 
     Write-Host ""
     Write-Host "============================================" -ForegroundColor Magenta
@@ -222,22 +331,16 @@ try {
     Write-Host "============================================" -ForegroundColor Magenta
     Write-Host "Dashboard:   http://127.0.0.1:5173"
     Write-Host "API health:  http://127.0.0.1:3001/api/health"
+    Write-Host "Listeners:   http://127.0.0.1:3001/api/listeners"
     Write-Host "Source RPC:  http://127.0.0.1:8545"
-    Write-Host "Dest RPC:    http://127.0.0.1:8546"
+    if ($destinationType -eq "evm") { Write-Host "Dest RPC:    http://127.0.0.1:8546" }
     Write-Host "Logs:        $Root\logs"
     Write-Host ""
-    Write-Host "Send a test tx in another window:  npm run demo:send"
+    Write-Host "Send a test tx in another window: npm run demo:send"
     Write-Host "Press Ctrl+C here to stop everything."
 
     while ($true) {
-        foreach ($job in $script:jobs) {
-            if ($job.Process.HasExited) {
-                Write-Fail "$($job.Name) exited with code $($job.Process.ExitCode)"
-                if (Test-Path $job.Err) { Get-Content $job.Err -Tail 20 }
-                if (Test-Path $job.Out) { Get-Content $job.Out -Tail 10 }
-                throw "$($job.Name) stopped unexpectedly."
-            }
-        }
+        foreach ($job in @($script:jobs)) { Test-ProcessAlive $job }
         Start-Sleep -Seconds 2
     }
 }

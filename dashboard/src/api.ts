@@ -2,8 +2,9 @@
 
 export type TxStatus =
   | "PENDING" | "VOTED" | "APPROVED" | "EXECUTING"
-  | "EXECUTED" | "FAILED" | "TIMED_OUT" | "REJECTED";
-
+  | "EXECUTED" | "FAILED" | "TIMED_OUT" | "REJECTED"
+  | "ROLLED_BACK";
+export type TransferMode = "MESSAGE_ONLY" | "ETH_TRANSFER";
 export interface Transaction {
   txId: string;
   sender: string;
@@ -13,6 +14,20 @@ export interface Transaction {
   nonce: string;
   sourceTimestamp: number;
   sourceBlockNumber: number;
+  sourceTransactionHash?: string;
+  sourceBlockHash?: string;
+  payloadText?: string;
+  payloadHash?: string;
+  transferMode: TransferMode;
+  requestedAmountWei: string;
+  sourceValueWei: string;
+  transferredAmountWei?: string;
+  destinationConfirmation?: boolean;
+  sourceChainId?: number;
+  sourceNetwork?: string;
+  sourceContractAddress?: string;
+  destinationNetwork?: string;
+  destinationReceiverAddress?: string;
   status: TxStatus;
   createdAt: number;
   updatedAt: number;
@@ -54,12 +69,35 @@ export interface Metrics {
   windowSeconds: number;
 }
 
+export interface SubmitTransactionRequest {
+  destinationChainId?: string;
+  destinationAddress?: string;
+  payload: string | Record<string, unknown>;
+  transferMode?: TransferMode;
+  amountEth?: string;
+}
+
+export interface SubmitTransactionResponse {
+  success: boolean;
+  txId: string | null;
+  transactionHash?: string;
+  txHash?: string;
+  hash?: string;
+  blockNumber?: number;
+  senderAddress?: string;
+  transferMode?: TransferMode;
+  requestedAmountWei?: string;
+}
+
 const API_BASE = "/api";
 
 async function apiFetch<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`);
-  if (!res.ok) throw new Error(`API ${path} → ${res.status}`);
-  return res.json() as Promise<T>;
+  const body = await res.json().catch(() => null) as { error?: string; message?: string } | null;
+  if (!res.ok) {
+    throw new Error(body?.error || body?.message || `API ${path} → ${res.status}`);
+  }
+  return body as T;
 }
 
 export const api = {
@@ -77,4 +115,14 @@ export const api = {
     apiFetch<{ listeners: ListenerHeartbeat[] }>(`/listeners`),
   getMetrics: () =>
     apiFetch<Metrics>(`/metrics`),
+  submitTransaction: async (request: SubmitTransactionRequest): Promise<SubmitTransactionResponse> => {
+    const res = await fetch(`${API_BASE}/transactions/submit`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    const result = await res.json() as SubmitTransactionResponse & { error?: string; message?: string };
+    if (!res.ok) throw new Error(result.error || result.message || `API /transactions/submit -> ${res.status}`);
+    return result;
+  },
 };

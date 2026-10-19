@@ -68,7 +68,10 @@ export async function executeTransaction(
   if (lastResult.success && DESTINATION_TYPE === "evm") {
     // Step 2: the destination tx is mined, but EXECUTED is only set once the
     // DestinationWatcher sees the Receiver's InterChainCompleted event.
-    await db.transitionStatus(tx.txId, ["EXECUTING"], "EXECUTING", { destTxHash: lastResult.destTxHash });
+    await db.transitionStatus(tx.txId, ["EXECUTING"], "EXECUTING", {
+      destTxHash: lastResult.destTxHash,
+      transferredAmountWei: lastResult.transferredAmountWei,
+    });
     log.info(
       { txId: tx.txId, destTxHash: lastResult.destTxHash },
       "Destination tx mined - awaiting InterChainCompleted confirmation"
@@ -79,6 +82,7 @@ export async function executeTransaction(
   if (lastResult.success) {
     const ok = await db.transitionStatus(tx.txId, ["EXECUTING"], "EXECUTED", {
       destTxHash: lastResult.destTxHash,
+      transferredAmountWei: lastResult.transferredAmountWei,
     });
     if (!ok) log.warn({ txId: tx.txId }, "Executed on destination but status was changed meanwhile (e.g. timed out)");
     log.info(

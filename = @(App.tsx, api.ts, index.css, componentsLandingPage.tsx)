@@ -1,0 +1,159 @@
+warning: in the working copy of 'dashboard\src\App.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'C:\Users\rd_ph\AppData\Local\Temp\smartlistener-step3-inspect\dashboard\src\App.tsx', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git "a/dashboard\\src\\App.tsx" "b/C:\\Users\\rd_ph\\AppData\\Local\\Temp\\smartlistener-step3-inspect\\dashboard\\src\\App.tsx"[m
+[1mindex 46fa58b..a4c3d33 100644[m
+[1m--- "a/dashboard\\src\\App.tsx"[m
+[1m+++ "b/C:\\Users\\rd_ph\\AppData\\Local\\Temp\\smartlistener-step3-inspect\\dashboard\\src\\App.tsx"[m
+[36m@@ -1,13 +1,13 @@[m
+ import React, { useState, useEffect, useCallback, useRef } from "react";[m
+ import { LandingPage } from "./components/LandingPage";[m
+ import { api } from "./api";[m
+[31m-import type { ListenerHeartbeat, Metrics, Transaction, TxStatus } from "./api";[m
+[32m+[m[32mimport type { ListenerHeartbeat, Metrics, ReceiverSummary, Transaction, TxStatus } from "./api";[m
+ [m
+ type Page = "landing" | "dashboard" | "submit";[m
+ [m
+ const STATUS_LIST: TxStatus[] = [[m
+   "PENDING", "VOTED", "APPROVED", "EXECUTING",[m
+[31m-  "EXECUTED", "FAILED", "TIMED_OUT", "REJECTED",[m
+[32m+[m[32m  "EXECUTED", "FAILED", "TIMED_OUT", "REJECTED", "ROLLED_BACK",[m
+ ];[m
+ [m
+ /* ---------- Small inline icons (replace emojis, inherit text colour) ---------- */[m
+[36m@@ -127,6 +127,7 @@[m [mexport default function App() {[m
+   const [transactions, setTransactions] = useState<Transaction[]>([]);[m
+   const [listeners, setListeners] = useState<ListenerHeartbeat[]>([]);[m
+   const [metrics, setMetrics] = useState<Metrics | null>(null);[m
+[32m+[m[32m  const [receiver, setReceiver] = useState<ReceiverSummary | null>(null);[m
+   const [loading, setLoading] = useState(false);[m
+   const [error, setError] = useState("");[m
+   const [notice, setNotice] = useState("");[m
+[36m@@ -143,10 +144,11 @@[m [mexport default function App() {[m
+     setLoading(true);[m
+ [m
+     try {[m
+[31m-      const [txResult, listenerResult, metricsResult] = await Promise.all([[m
+[32m+[m[32m      const [txResult, listenerResult, metricsResult, receiverResult] = await Promise.all([[m
+         api.getTransactions({ limit: 100 }),[m
+         api.getListeners(),[m
+         api.getMetrics(),[m
+[32m+[m[32m        api.getReceiver().catch(() => null), // destination view must never break the dashboard[m
+       ]);[m
+ [m
+       setTransactions([m
+[36m@@ -160,6 +162,7 @@[m [mexport default function App() {[m
+           : (listenerResult as { listeners?: ListenerHeartbeat[] }).listeners ?? [][m
+       );[m
+       setMetrics(metricsResult);[m
+[32m+[m[32m      setReceiver(receiverResult);[m
+       setError("");[m
+     } catch (err) {[m
+       setError(err instanceof Error ? err.message : "Unable to load dashboard data.");[m
+[36m@@ -250,6 +253,7 @@[m [mexport default function App() {[m
+         ["Failed", metrics.failed],[m
+         ["Rejected", metrics.rejected],[m
+         ["Timed out", metrics.timedOut],[m
+[32m+[m[32m        ["Rolled back", metrics.rolledBack],[m
+         ["Average latency", `${metrics.avgLatencyMs} ms`],[m
+         ["Throughput", `${metrics.throughputPerMinute}/min`],[m
+       ][m
+[36m@@ -377,6 +381,75 @@[m [mexport default function App() {[m
+               </div>[m
+             </Panel>[m
+ [m
+[32m+[m[32m            <Panel[m
+[32m+[m[32m              title="Destination chain (Receiver)"[m
+[32m+[m[32m              description="What the destination contract has actually executed."[m
+[32m+[m[32m            >[m
+[32m+[m[32m              {!receiver && <p className="empty-state">Destination view unavailable.</p>}[m
+[32m+[m[32m              {receiver && ([m
+[32m+[m[32m                <>[m
+[32m+[m[32m                  <div className="listener-grid">[m
+[32m+[m[32m                    <div className="listener-card">[m
+[32m+[m[32m                      <div className="listener-card-header">[m
+[32m+[m[32m                        <h3>Receiver contract</h3>[m
+[32m+[m[32m                        <span className={`badge ${receiver.reachable ? "badge-EXECUTED" : "badge-FAILED"}`}>[m
+[32m+[m[32m                          <span className="badge-dot" />[m
+[32m+[m[32m                          {receiver.reachable ? "Reachable" : "Unreachable"}[m
+[32m+[m[32m                        </span>[m
+[32m+[m[32m                      </div>[m
+[32m+[m[32m                      <div className="listener-detail">[m
+[32m+[m[32m                        <span>Address</span>[m
+[32m+[m[32m                        <span className="mono-cell">{receiver.address ? `${receiver.address.slice(0, 10)}…${receiver.address.slice(-6)}` : "—"}</span>[m
+[32m+[m[32m                      </div>[m
+[32m+[m[32m                      <div className="listener-detail">[m
+[32m+[m[32m                        <span>Chain ID</span>[m
+[32m+[m[32m                        <span className="mono-cell">{receiver.chainId ?? "—"}</span>[m
+[32m+[m[32m                      </div>[m
+[32m+[m[32m                      <div className="listener-detail">[m
+[32m+[m[32m                        <span>Latest block</span>[m
+[32m+[m[32m                        <span className="mono-cell">{receiver.latestBlock ?? "—"}</span>[m
+[32m+[m[32m                      </div>[m
+[32m+[m[32m                    </div>[m
+[32m+[m[32m                    <div className="listener-card">[m
+[32m+[m[32m                      <div className="listener-card-header">[m
+[32m+[m[32m                        <h3>Executed on destination</h3>[m
+[32m+[m[32m                      </div>[m
+[32m+[m[32m                      <div className="metric-value">{receiver.executedCount ?? "—"}</div>[m
+[32m+[m[32m                      {receiver.error && <p className="form-hint">{receiver.error}</p>}[m
+[32m+[m[32m                    </div>[m
+[32m+[m[32m                  </div>[m
+[32m+[m
+[32m+[m[32m                  <div className="table-wrap" style={{ marginTop: 16 }}>[m
+[32m+[m[32m                    <table className="data-table">[m
+[32m+[m[32m                      <thead>[m
+[32m+[m[32m                        <tr>[m
+[32m+[m[32m                          <th>Source tx</th>[m
+[32m+[m[32m                          <th>Executor</th>[m
+[32m+[m[32m                          <th>Destination tx</th>[m
+[32m+[m[32m                          <th>Block</th>[m
+[32m+[m[32m                          <th>Time</th>[m
+[32m+[m[32m                        </tr>[m
+[32m+[m[32m                      </thead>[m
+[32m+[m[32m                      <tbody>[m
+[32m+[m[32m                        {receiver.recent.map((e) => ([m
+[32m+[m[32m                          <tr key={e.destTxHash}>[m
+[32m+[m[32m                            <td className="mono-cell" title={e.txId}>{e.txId.slice(0, 12)}…</td>[m
+[32m+[m[32m                            <td className="mono-cell">{e.executor.slice(0, 8)}…{e.executor.slice(-4)}</td>[m
+[32m+[m[32m                            <td className="mono-cell" title={e.destTxHash}>{e.destTxHash.slice(0, 12)}…</td>[m
+[32m+[m[32m                            <td className="mono-cell">{e.blockNumber}</td>[m
+[32m+[m[32m                            <td>{new Date(e.timestamp * 1000).toLocaleTimeString()}</td>[m
+[32m+[m[32m                          </tr>[m
+[32m+[m[32m                        ))}[m
+[32m+[m[32m                        {receiver.recent.length === 0 && ([m
+[32m+[m[32m                          <tr><td colSpan={5} className="empty-state">Nothing executed on the destination yet.</td></tr>[m
+[32m+[m[32m                        )}[m
+[32m+[m[32m                      </tbody>[m
+[32m+[m[32m                    </table>[m
+[32m+[m[32m                  </div>[m
+[32m+[m[32m                </>[m
+[32m+[m[32m              )}[m
+[32m+[m[32m            </Panel>[m
+[32m+[m
+             <Panel[m
+               title="Transactions"[m
+               description={`${visibleTransactions.length} shown`}[m
+[36m@@ -503,10 +576,12 @@[m [mexport default function App() {[m
+                     <li>The source contract emits a transaction event.</li>[m
+                     <li>Four independent listeners validate the event and cast votes.</li>[m
+                     <li>Three matching approval votes (a strict majority of four) are required.</li>[m
+[31m-                    <li>The destination adapter processes an approved transaction.</li>[m
+[32m+[m[32m                    <li>The destination Receiver contract executes it before its deadline and emits InterChainCompleted.</li>[m
+                   </ol>[m
+                   <p className="form-hint" style={{ marginTop: 16 }}>[m
+[31m-                    A successful source submission does not by itself confirm destination execution.[m
+[32m+[m[32m                    Submitting escrows 0.01 ETH on the source chain immediately (optimistic). If the[m
+[32m+[m[32m                    destination does not complete within the rollback window, the source rolls back[m
+[32m+[m[32m                    and refunds it.[m
+                   </p>[m
+                 </Panel>[m
+               </aside>[m
+[36m@@ -520,7 +595,7 @@[m [mexport default function App() {[m
+           Smart Listener · Bigiotti et al. (2025) · Majority-vote variant of the Smart Listeners protocol[m
+         </span>[m
+         <span className="footer-note">[m
+[31m-          Simulated destination · No cross-chain atomicity guarantee[m
+[32m+[m[32m          Local test chains · Votes are not threshold-signed (yet)[m
+         </span>[m
+       </footer>[m
+     </div>[m

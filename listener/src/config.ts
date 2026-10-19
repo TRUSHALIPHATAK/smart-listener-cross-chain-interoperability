@@ -105,10 +105,12 @@ export const SQLITE_PATH        = optional("SQLITE_PATH", path.join(__dirname, "
  */
 export const DESTINATION_TYPE   = optional("DESTINATION_TYPE", "evm") as "evm" | "simulated" | "fabric";
 export const DEST_RPC_URL       = optional("DEST_RPC_URL", "http://127.0.0.1:8546");
+export const DEST_CHAIN_ID      = optionalInt("DEST_CHAIN_ID", 31338);
 export const DESTINATION_RECEIVER_ADDRESS: string =
   process.env.DESTINATION_RECEIVER_ADDRESS ?? deployment.DestinationReceiver ?? "";
 /** Local-demo only: Hardhat's public test mnemonic. Listener A..D use accounts #1..#4. */
 export const EXECUTOR_MNEMONIC  = optional("EXECUTOR_MNEMONIC", "test test test test test test test test test test test junk");
+export const OWNER_MNEMONIC     = optional("OWNER_MNEMONIC", "test test test test test test test test test test test junk");
 
 // Fabric (only used when DESTINATION_TYPE=fabric)
 export const FABRIC_CHANNEL     = optional("FABRIC_CHANNEL", "mychannel");
@@ -121,6 +123,10 @@ export const FABRIC_GATEWAY_URL = optional("FABRIC_GATEWAY_URL", "");
 
 export const API_PORT           = optionalInt("API_PORT", 3001);
 export const API_HOST           = optional("API_HOST", "127.0.0.1");
+export const API_CORS_ORIGINS   = optional(
+  "API_CORS_ORIGINS",
+  "http://127.0.0.1:5173,http://localhost:5173",
+).split(",").map((origin) => origin.trim()).filter(Boolean);
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 

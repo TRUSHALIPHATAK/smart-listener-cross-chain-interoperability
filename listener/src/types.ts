@@ -16,12 +16,15 @@ export type TxStatus =
   | "EXECUTED"
   | "FAILED"
   | "TIMED_OUT"
-  | "REJECTED";
+  | "REJECTED"
+  | "ROLLED_BACK";
+
 
 export const LISTENER_IDS = ["A", "B", "C", "D"] as const;
 export type ListenerId = (typeof LISTENER_IDS)[number];
 
 export type VoteValue = "APPROVE" | "REJECT";
+export type TransferMode = "MESSAGE_ONLY" | "ETH_TRANSFER";
 
 export interface CrossChainTransaction {
   /** Unique ID from the SenderContract event (bytes32 hex) */
@@ -40,6 +43,17 @@ export interface CrossChainTransaction {
   sourceTimestamp: number;
   /** Block number of source event */
   sourceBlockNumber: number;
+  /** Source-chain transaction hash, when known */
+  sourceTransactionHash?: string;
+  /** Source-chain block hash, when known */
+  sourceBlockHash?: string;
+  payloadText?: string;
+  payloadHash?: string;
+  transferMode?: TransferMode;
+  requestedAmountWei?: string;
+  sourceValueWei?: string;
+  transferredAmountWei?: string;
+  destinationConfirmation?: boolean;
   /** Current status */
   status: TxStatus;
   /** When first seen by any Listener (ms epoch) */
@@ -84,6 +98,7 @@ export interface TransactionEvent {
   blockNumber: number;
   blockHash: string;
   transactionHash: string;
+  amount: bigint;
 }
 
 export interface DestinationResult {
@@ -92,6 +107,7 @@ export interface DestinationResult {
   errorMessage?: string;
   /** Latency in milliseconds from APPROVED to EXECUTED */
   latencyMs?: number;
+  transferredAmountWei?: string;
 }
 
 export interface MetricsSummary {
@@ -102,6 +118,7 @@ export interface MetricsSummary {
   failed: number;
   timedOut: number;
   rejected: number;
+  rolledBack: number;
   avgLatencyMs: number;
   throughputPerMinute: number;
   listeners: ListenerHeartbeat[];

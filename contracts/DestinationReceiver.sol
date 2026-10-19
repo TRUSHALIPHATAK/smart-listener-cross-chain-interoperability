@@ -15,7 +15,9 @@ contract DestinationReceiver {
         bytes32 indexed sourceTxId,
         address indexed executor,
         bytes32 payloadHash,
-        uint256 timestamp
+        uint256 timestamp,
+        address recipient,
+        uint256 amount
     );
 
     mapping(address => bool) public isExecutor;
@@ -25,6 +27,9 @@ contract DestinationReceiver {
     error NotExecutor();
     error AlreadyExecuted();
     error EmptyPayload();
+    error InvalidRecipient();
+    error InsufficientReserve();
+    error TransferFailed();
 
     constructor(address[] memory executors) {
         for (uint256 i = 0; i < executors.length; i++) {
@@ -40,10 +45,31 @@ contract DestinationReceiver {
         executed[sourceTxId] = true;
         unchecked { executedCount++; }
 
-        emit InterChainCompleted(sourceTxId, msg.sender, keccak256(payload), block.timestamp);
+        emit InterChainCompleted(sourceTxId, msg.sender, keccak256(payload), block.timestamp, address(0), 0);
+    }
+
+    function executeValue(
+        bytes32 sourceTxId,
+        address recipient,
+        bytes calldata payload,
+        uint256 amount
+    ) external {
+        if (!isExecutor[msg.sender]) revert NotExecutor();
+        if (executed[sourceTxId]) revert AlreadyExecuted();
+        if (recipient == address(0)) revert InvalidRecipient();
+        if (payload.length == 0) revert EmptyPayload();
+        if (amount == 0 || address(this).balance < amount) revert InsufficientReserve();
+
+        executed[sourceTxId] = true;
+        unchecked { executedCount++; }
+        (bool ok, ) = payable(recipient).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit InterChainCompleted(sourceTxId, msg.sender, keccak256(payload), block.timestamp, recipient, amount);
     }
 
     function wasExecuted(bytes32 txId) external view returns (bool) {
         return executed[txId];
     }
+
+    receive() external payable {}
 }

@@ -14,8 +14,61 @@ function truncate(s: string, n = 40) {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
+function CopyValue({ value }: { value?: string }) {
+  if (!value) return <span>Not available</span>;
+  return (
+    <span style={{ display: "inline-flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+      <span>{truncate(value, 72)}</span>
+      <button
+        type="button"
+        onClick={() => void navigator.clipboard?.writeText(value)}
+        style={{
+          background: "#ffeef3", border: "1px solid #f5c0d0", borderRadius: 5,
+          color: "#9b1b4a", cursor: "pointer", padding: "3px 7px", fontSize: 11,
+        }}
+      >Copy</button>
+    </span>
+  );
+}
+
+function formatWei(value?: string) {
+  if (!value) return "Not available";
+  try {
+    const whole = value.padStart(19, "0");
+    const split = whole.length - 18;
+    return `${whole.slice(0, split)}.${whole.slice(split).replace(/0+$/, "") || "0"} ETH`;
+  } catch {
+    return "Not available";
+  }
+}
+
 export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
   const votes: Vote[] = tx.votes ?? [];
+  const fields: Array<[string, string | undefined]> = [
+    ["Internal transaction ID", tx.txId],
+    ["Source transaction hash", tx.sourceTransactionHash],
+    ["Source block hash", tx.sourceBlockHash],
+    ["Sender", tx.sender],
+    ["Source block", String(tx.sourceBlockNumber)],
+    ["Source chain", `${tx.sourceChainId ?? 31337} (${tx.sourceNetwork ?? "local Hardhat"})`],
+    ["Source contract", tx.sourceContractAddress],
+    ["Destination chain", tx.destinationChainId],
+    ["Destination network", tx.destinationNetwork],
+    ["Destination receiver", tx.destinationReceiverAddress],
+    ["Destination address", tx.destinationAddress],
+    ["Nonce", tx.nonce],
+    ["Payload", tx.payload],
+    ["Decoded payload", tx.payloadText],
+    ["Payload hash", tx.payloadHash],
+    ["Transfer mode", tx.transferMode === "ETH_TRANSFER" ? "ETH transfer with payload" : "Message-only transaction — no ETH transfer"],
+    ["Requested amount", tx.transferMode === "ETH_TRANSFER" ? formatWei(tx.requestedAmountWei) : "0 ETH"],
+    ["Source value accepted", formatWei(tx.sourceValueWei)],
+    ["Transferred amount", tx.transferredAmountWei ? formatWei(tx.transferredAmountWei) : "Not confirmed"],
+    ["Destination confirmation", tx.destinationConfirmation ? "Confirmed" : "Not confirmed"],
+    ["Destination tx hash", tx.destTxHash],
+    ["Created", fmt(tx.createdAt)],
+    ["Updated", fmt(tx.updatedAt)],
+  ];
 
   return (
     <div className="detail-overlay" onClick={onClose} style={{
@@ -59,9 +112,7 @@ export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
               <span className="badge-dot" />
               {tx.status}
             </span>
-            {tx.errorMessage && (
-              <span style={{ fontSize: 12, color: "#8a2048" }}>{tx.errorMessage}</span>
-            )}
+            {tx.errorMessage && <span style={{ fontSize: 12, color: "#8a2048" }}>{tx.errorMessage}</span>}
           </div>
         </div>
 
@@ -90,16 +141,7 @@ export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
           </div>
         </div>
 
-        {[
-          ["Sender", tx.sender],
-          ["Destination chain", tx.destinationChainId],
-          ["Destination address", truncate(tx.destinationAddress)],
-          ["Nonce", tx.nonce],
-          ["Payload", truncate(tx.payload, 64)],
-          ["Dest tx hash", tx.destTxHash ?? "—"],
-          ["Created", fmt(tx.createdAt)],
-          ["Updated", fmt(tx.updatedAt)],
-        ].map(([label, value]) => (
+        {fields.map(([label, value]) => (
           <div key={label} style={{ padding: "12px 0", borderBottom: "1px solid #f5c0d0" }}>
             <div style={{ fontSize: 11, fontWeight: 600, color: "#9b4a66", textTransform: "uppercase" }}>
               {label}
@@ -107,7 +149,9 @@ export const TransactionDetail: React.FC<Props> = ({ tx, onClose }) => {
             <div style={{
               fontFamily: "monospace", fontSize: 13, color: "#6e1034",
               wordBreak: "break-all", marginTop: 4,
-            }}>{value}</div>
+            }}>{label.toLowerCase().includes("hash") || label.includes("address") || label.includes("ID")
+              ? <CopyValue value={value} />
+              : (value || "Not available")}</div>
           </div>
         ))}
       </div>

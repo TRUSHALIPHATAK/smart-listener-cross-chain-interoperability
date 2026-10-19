@@ -1,14 +1,28 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { LandingPage } from "./components/LandingPage";
 import { api } from "./api";
-import type { ListenerHeartbeat, Metrics, Transaction, TxStatus } from "./api";
+import { TransactionDetail } from "./components/TransactionDetail";
+import type { ListenerHeartbeat, Metrics, Transaction, TxStatus, TransferMode } from "./api";
 
 type Page = "landing" | "dashboard" | "submit";
 
 const STATUS_LIST: TxStatus[] = [
   "PENDING", "VOTED", "APPROVED", "EXECUTING",
-  "EXECUTED", "FAILED", "TIMED_OUT", "REJECTED",
+  "EXECUTED", "FAILED", "TIMED_OUT", "REJECTED", "ROLLED_BACK",
 ];
+const STATUS_FILTERS = [
+  { value: "", label: "All statuses" },
+  ...STATUS_LIST.map((status) => ({ value: status, label: status })),
+  { value: "ERROR", label: "ERROR (failed/rejected/timed out)" },
+] as const;
+
+function normalizeStatus(status: string): TxStatus {
+  const normalized = status.trim().toUpperCase();
+  if (normalized === "ERROR") return "FAILED";
+  return STATUS_LIST.includes(normalized as TxStatus)
+    ? normalized as TxStatus
+    : "FAILED";
+}
 
 /* ---------- Small inline icons (replace emojis, inherit text colour) ---------- */
 
@@ -131,20 +145,25 @@ export default function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [filter, setFilter] = useState("");
+  const [search, setSearch] = useState("");
 
   const [destinationAddress, setDestinationAddress] = useState(
     "0xRecipientAddressOnDest"
   );
   const [payload, setPayload] = useState("Hello from Smart Listener");
+  const [transferMode, setTransferMode] = useState<TransferMode>("MESSAGE_ONLY");
+  const [amountEth, setAmountEth] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submittedHash, setSubmittedHash] = useState("");
+  const [selectedTransaction, setSelectedTransaction] = useState<Transaction | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   const loadDashboard = useCallback(async () => {
     setLoading(true);
 
     try {
       const [txResult, listenerResult, metricsResult] = await Promise.all([
-        api.getTransactions({ limit: 100 }),
+        api.getTransactions({ limit: 200 }),
         api.getListeners(),
         api.getMetrics(),
       ]);
@@ -204,17 +223,21 @@ export default function App() {
     setSubmittedHash("");
 
     try {
-      const response = await fetch("/api/transactions/submit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ destinationAddress, payload }),
-      });
-
-      const result = await response.json();
-
-      if (!response.ok) {
-        throw new Error(result.error || result.message || "Transaction submission failed.");
+      if (!destinationAddress.trim()) throw new Error("Destination recipient is required.");
+      if (transferMode === "ETH_TRANSFER") {
+        if (!/^0x[0-9a-fA-F]{40}$/.test(destinationAddress.trim())) {
+          throw new Error("ETH transfers require a valid destination EVM address.");
+        }
+        if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(amountEth.trim()) || Number(amountEth) <= 0) {
+          throw new Error("Enter a positive ETH amount, for example 0.01.");
+        }
       }
+      const result = await api.submitTransaction({
+        destinationAddress,
+        payload,
+        transferMode,
+        amountEth: transferMode === "ETH_TRANSFER" ? amountEth : "0",
+      });
 
       const hash = result.transactionHash ?? result.txHash ?? result.hash ?? "";
       setSubmittedHash(hash);
@@ -224,6 +247,7 @@ export default function App() {
           : "The API accepted the request. Check the response and dashboard for transaction details."
       );
       await loadDashboard();
+      setPage("dashboard");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not submit the transaction.");
     } finally {
@@ -231,9 +255,29 @@ export default function App() {
     }
   }
 
-  const visibleTransactions = transactions.filter(
-    (tx) => !filter || tx.status === filter
-  );
+  const visibleTransactions = transactions.filter((tx) => {
+    const status = normalizeStatus(tx.status);
+    const matchesStatus = !filter
+      || (filter === "ERROR" && ["FAILED", "REJECTED", "TIMED_OUT"].includes(status))
+      || status === filter;
+    const needle = search.trim().toLowerCase();
+    const matchesSearch = !needle || [
+      tx.txId, tx.sender, tx.destinationAddress, tx.sourceTransactionHash ?? "", tx.destTxHash ?? "",
+    ].some((value) => value.toLowerCase().includes(needle));
+    return matchesStatus && matchesSearch;
+  });
+
+  async function openTransaction(txId: string) {
+    setDetailLoading(true);
+    setError("");
+    try {
+      setSelectedTransaction(await api.getTransaction(txId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load transaction details.");
+    } finally {
+      setDetailLoading(false);
+    }
+  }
 
   const navItems: { page: Page; label: string; icon: IconName }[] = [
     { page: "landing", label: "Overview", icon: "overview" },
@@ -383,14 +427,20 @@ export default function App() {
               actions={
                 <div className="filter-row">
                   <label htmlFor="status-filter">Status</label>
+                  <input
+                    id="transaction-search"
+                    aria-label="Search transactions"
+                    placeholder="Search ID, address, or hash"
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                  />
                   <select
                     id="status-filter"
                     value={filter}
                     onChange={(event) => setFilter(event.target.value)}
                   >
-                    <option value="">All statuses</option>
-                    {STATUS_LIST.map((status) => (
-                      <option key={status} value={status}>{status}</option>
+                    {STATUS_FILTERS.map((status) => (
+                      <option key={status.value} value={status.value}>{status.label}</option>
                     ))}
                   </select>
                 </div>
@@ -401,6 +451,7 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>Transaction ID</th>
+                      <th>Destination chain</th>
                       <th>Destination</th>
                       <th>Status</th>
                       <th>Destination tx</th>
@@ -410,22 +461,29 @@ export default function App() {
                   </thead>
                   <tbody>
                     {visibleTransactions.map((tx) => (
-                      <tr key={tx.txId}>
+                      <tr
+                        key={tx.txId}
+                        onClick={() => void openTransaction(tx.txId)}
+                        style={{ cursor: "pointer" }}
+                      >
                         <td className="mono-cell" title={tx.txId}>
                           {tx.txId.slice(0, 12)}…
                         </td>
-                        <td className="mono-cell">{tx.destinationAddress}</td>
-                        <td><StatusBadge status={tx.status} /></td>
+                        <td className="mono-cell table-chain" title={tx.destinationChainId}>{tx.destinationChainId}</td>
+                        <td className="mono-cell table-address" title={tx.destinationAddress}>{tx.destinationAddress}</td>
+                        <td className="table-status"><StatusBadge status={normalizeStatus(tx.status)} /></td>
                         <td className="mono-cell" title={tx.destTxHash}>
                           {tx.destTxHash ? `${tx.destTxHash.slice(0, 12)}…` : "—"}
                         </td>
-                        <td>{tx.approveVotes ?? 0} approve / {tx.rejectVotes ?? 0} reject</td>
-                        <td>{tx.errorMessage || "—"}</td>
+                        <td className="table-votes">{tx.approveVotes ?? 0} / 3 approve</td>
+                        <td className="table-error" title={tx.errorMessage}>{tx.errorMessage || "—"}</td>
                       </tr>
                     ))}
                     {!loading && visibleTransactions.length === 0 && (
                       <tr>
-                        <td colSpan={6} className="empty-state">No transactions found.</td>
+                        <td colSpan={7} className="empty-state">
+                          {loading ? "Loading transactions…" : filter ? "No transactions found for this status." : "No transactions found."}
+                        </td>
                       </tr>
                     )}
                   </tbody>
@@ -458,6 +516,38 @@ export default function App() {
                       placeholder="Destination address"
                     />
                   </div>
+
+                  <div className="form-group">
+                    <label htmlFor="transfer-mode">Transfer mode</label>
+                    <select
+                      id="transfer-mode"
+                      value={transferMode}
+                      onChange={(event) => {
+                        const mode = event.target.value as TransferMode;
+                        setTransferMode(mode);
+                        if (mode === "MESSAGE_ONLY") setAmountEth("");
+                      }}
+                    >
+                      <option value="MESSAGE_ONLY">Message-only — no ETH transfer</option>
+                      <option value="ETH_TRANSFER">ETH transfer with payload</option>
+                    </select>
+                  </div>
+
+                  {transferMode === "ETH_TRANSFER" && (
+                    <div className="form-group">
+                      <label htmlFor="amount-eth">ETH amount</label>
+                      <input
+                        id="amount-eth"
+                        type="text"
+                        inputMode="decimal"
+                        value={amountEth}
+                        onChange={(event) => setAmountEth(event.target.value)}
+                        required
+                        placeholder="0.01"
+                      />
+                      <p className="form-hint">Exact positive ETH amount. The backend validates and converts it to wei.</p>
+                    </div>
+                  )}
 
                   <div className="form-group">
                     <label htmlFor="payload">Payload</label>
@@ -514,6 +604,14 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {detailLoading && <div className="detail-loading" role="status">Loading transaction details…</div>}
+      {selectedTransaction && (
+        <TransactionDetail
+          tx={selectedTransaction}
+          onClose={() => setSelectedTransaction(null)}
+        />
+      )}
 
       <footer className="footer">
         <span>

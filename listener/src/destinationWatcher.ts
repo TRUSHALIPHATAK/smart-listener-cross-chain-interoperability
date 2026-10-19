@@ -10,13 +10,14 @@
 import { ethers } from "ethers";
 import { DbAdapter } from "./db";
 import { childLogger } from "./logger";
-import { DEST_RPC_URL, DESTINATION_RECEIVER_ADDRESS, POLL_INTERVAL_MS } from "./config";
+import { DEST_CHAIN_ID, DEST_RPC_URL, DESTINATION_RECEIVER_ADDRESS, POLL_INTERVAL_MS, SOURCE_RPC_URL, SENDER_CONTRACT_ADDRESS, OWNER_MNEMONIC } from "./config";
 
 const log = childLogger("destinationWatcher");
 
 const ABI = [
-  "event InterChainCompleted(bytes32 indexed sourceTxId, address indexed executor, bytes32 payloadHash, uint256 timestamp)",
+  "event InterChainCompleted(bytes32 indexed sourceTxId, address indexed executor, bytes32 payloadHash, uint256 timestamp, address recipient, uint256 amount)",
 ];
+const SOURCE_ABI = ["function finalizeTransaction(bytes32 txId)"];
 
 export type CompletionOutcome = "confirmed" | "late" | "ignored";
 
@@ -27,12 +28,33 @@ export type CompletionOutcome = "confirmed" | "late" | "ignored";
  *               this is exactly the case rollback handles in Step 3)
  *  - ignored:   unknown tx, or already in some other state
  */
-export async function handleCompleted(db: DbAdapter, txId: string, destTxHash: string): Promise<CompletionOutcome> {
-  const changed = await db.transitionStatus(txId, ["APPROVED", "EXECUTING"], "EXECUTED", { destTxHash });
-  if (changed) return "confirmed";
+export async function handleCompleted(
+  db: DbAdapter,
+  txId: string,
+  destTxHash: string,
+  amountWei = "0",
+): Promise<CompletionOutcome> {
   const tx = await db.getTransaction(txId);
-  if (!tx) return "ignored";
-  if (tx.status === "TIMED_OUT") return "late";
+  const changed = await db.transitionStatus(txId, ["APPROVED", "EXECUTING"], "EXECUTED", {
+    destTxHash,
+    destinationConfirmation: true,
+    transferredAmountWei: amountWei !== "0" ? amountWei : undefined,
+  });
+  if (changed && tx?.transferMode === "ETH_TRANSFER") {
+    try {
+      const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
+      const wallet = ethers.HDNodeWallet.fromPhrase(OWNER_MNEMONIC).connect(provider);
+      const source = new ethers.Contract(SENDER_CONTRACT_ADDRESS, SOURCE_ABI, new ethers.NonceManager(wallet));
+      const finalization = await source.finalizeTransaction(txId);
+      await finalization.wait();
+    } catch (err) {
+      log.warn({ txId, err }, "Destination confirmed but source escrow finalization failed");
+    }
+  }
+  if (changed) return "confirmed";
+  const current = await db.getTransaction(txId);
+  if (!current) return "ignored";
+  if (current.status === "TIMED_OUT") return "late";
   return "ignored";
 }
 
@@ -76,6 +98,13 @@ export class DestinationWatcher {
     this.busy = true;
     try {
       const { provider, contract } = this.ensure();
+      const network = await provider.getNetwork();
+      if (Number(network.chainId) !== DEST_CHAIN_ID) {
+        throw new Error(`Destination RPC chain ID ${network.chainId} does not match configured ${DEST_CHAIN_ID}`);
+      }
+      if (await provider.getCode(DESTINATION_RECEIVER_ADDRESS) === "0x") {
+        throw new Error(`No contract code at DestinationReceiver ${DESTINATION_RECEIVER_ADDRESS} on destination chain ${DEST_CHAIN_ID}`);
+      }
       const latest = await provider.getBlockNumber();
 
       // Destination chain was reset (fresh node): rescan from genesis.
@@ -88,7 +117,8 @@ export class DestinationWatcher {
         for (const entry of logs) {
           if (!("args" in entry)) continue;
           const txId = String(entry.args[0]);
-          const outcome = await handleCompleted(this.db, txId, entry.transactionHash);
+          const amount = "args" in entry ? String(entry.args[5] ?? 0) : "0";
+          const outcome = await handleCompleted(this.db, txId, entry.transactionHash, amount);
           if (outcome === "confirmed") {
             log.info({ txId, destTxHash: entry.transactionHash, block: entry.blockNumber }, "InterChainCompleted seen - transaction EXECUTED");
           } else if (outcome === "late") {

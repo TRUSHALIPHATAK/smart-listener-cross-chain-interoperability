@@ -31,7 +31,8 @@ contract SenderContract {
         bytes   destinationAddress,
         bytes   payload,
         uint256 nonce,
-        uint256 timestamp
+        uint256 timestamp,
+        uint256 amount
     );
 
     /**
@@ -52,6 +53,10 @@ contract SenderContract {
 
     /// @notice txId → sender (for cancel validation)
     mapping(bytes32 => address) public txSenders;
+    mapping(bytes32 => uint256) public txAmounts;
+    mapping(bytes32 => uint256) public txSubmittedAt;
+    mapping(bytes32 => bool) public txFinalized;
+    mapping(bytes32 => bool) public txRefunded;
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
@@ -60,6 +65,12 @@ contract SenderContract {
     error EmptyPayload();
     error NotTxSender();
     error TxAlreadyCancelled();
+    error InvalidAmount();
+    error NotFinalizable();
+    error RefundTooEarly();
+    error TransferFailed();
+
+    uint256 public constant REFUND_DELAY = 60 seconds;
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -92,7 +103,7 @@ contract SenderContract {
         bytes32 destinationChainId,
         bytes calldata destinationAddress,
         bytes calldata payload
-    ) external whenNotPaused returns (bytes32 txId) {
+    ) external payable whenNotPaused returns (bytes32 txId) {
         if (destinationAddress.length == 0) revert EmptyDestinationAddress();
         if (payload.length == 0) revert EmptyPayload();
 
@@ -106,11 +117,14 @@ contract SenderContract {
                 destinationChainId,
                 destinationAddress,
                 payload,
+                msg.value,
                 block.chainid
             )
         );
 
         txSenders[txId] = msg.sender;
+        txAmounts[txId] = msg.value;
+        txSubmittedAt[txId] = block.timestamp;
 
         emit TransactionSent(
             txId,
@@ -119,7 +133,8 @@ contract SenderContract {
             destinationAddress,
             payload,
             nonce,
-            block.timestamp
+            block.timestamp,
+            msg.value
         );
     }
 
@@ -128,11 +143,45 @@ contract SenderContract {
      */
     function cancelTransaction(bytes32 txId) external {
         if (txSenders[txId] != msg.sender) revert NotTxSender();
-        if (txSenders[txId] == address(0)) revert TxAlreadyCancelled();
+        if (txFinalized[txId] || txRefunded[txId]) revert TxAlreadyCancelled();
 
+        uint256 amount = txAmounts[txId];
         delete txSenders[txId];
+        txRefunded[txId] = true;
+        if (amount > 0) {
+            (bool ok, ) = payable(msg.sender).call{value: amount}("");
+            if (!ok) revert TransferFailed();
+        }
         emit TransactionCancelled(txId, msg.sender);
     }
+
+    function finalizeTransaction(bytes32 txId) external onlyOwner {
+        address sender = txSenders[txId];
+        if (sender == address(0) || txFinalized[txId] || txRefunded[txId]) revert NotFinalizable();
+        uint256 amount = txAmounts[txId];
+        txFinalized[txId] = true;
+        delete txSenders[txId];
+        if (amount > 0) {
+            (bool ok, ) = payable(owner).call{value: amount}("");
+            if (!ok) revert TransferFailed();
+        }
+    }
+
+    function refundTransaction(bytes32 txId) external {
+        address sender = txSenders[txId];
+        if (sender != msg.sender) revert NotTxSender();
+        if (txFinalized[txId] || txRefunded[txId]) revert TxAlreadyCancelled();
+        if (block.timestamp < txSubmittedAt[txId] + REFUND_DELAY) revert RefundTooEarly();
+        uint256 amount = txAmounts[txId];
+        txRefunded[txId] = true;
+        delete txSenders[txId];
+        if (amount > 0) {
+            (bool ok, ) = payable(msg.sender).call{value: amount}("");
+            if (!ok) revert TransferFailed();
+        }
+    }
+
+    receive() external payable {}
 
     // ── Admin ─────────────────────────────────────────────────────────────────
 

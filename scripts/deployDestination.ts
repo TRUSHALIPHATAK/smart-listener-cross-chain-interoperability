@@ -22,6 +22,12 @@ async function main() {
   await receiver.waitForDeployment();
   const address = await receiver.getAddress();
   console.log("DestinationReceiver deployed at:", address);
+  const reserveTx = await deployer.sendTransaction({
+    to: address,
+    value: ethers.parseEther("100"),
+  });
+  await reserveTx.wait();
+  console.log("DestinationReceiver reserve funded with 100 ETH");
 
   const file = path.join(__dirname, "..", "listener", "config", "deployment.json");
   if (!fs.existsSync(file)) {
@@ -33,6 +39,7 @@ async function main() {
     chainId: net.chainId.toString(),
     deployer: deployer.address,
     executors,
+    reserveWei: ethers.parseEther("100").toString(),
     deployedAt: new Date().toISOString(),
   };
   fs.writeFileSync(file, JSON.stringify(info, null, 2));

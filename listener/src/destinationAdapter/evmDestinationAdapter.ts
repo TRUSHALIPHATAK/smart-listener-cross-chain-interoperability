@@ -20,6 +20,7 @@ const log = childLogger("evmDestinationAdapter");
 
 const RECEIVER_ABI = [
   "function execute(bytes32 sourceTxId, bytes payload)",
+  "function executeValue(bytes32 sourceTxId, address recipient, bytes payload, uint256 amount)",
   "function wasExecuted(bytes32 txId) view returns (bool)",
   "event InterChainCompleted(bytes32 indexed sourceTxId, address indexed executor, bytes32 payloadHash, uint256 timestamp)",
 ];
@@ -57,14 +58,28 @@ export async function evmExecute(tx: CrossChainTransaction): Promise<Destination
       return { success: true, destTxHash: hash, latencyMs: Date.now() - start };
     }
 
-    const response = await c.execute(tx.txId, toHexBytes(tx.payload));
+    let response;
+    if (tx.transferMode === "ETH_TRANSFER") {
+      if (!ethers.isHexString(tx.destinationAddress, 20)) {
+        return { success: false, errorMessage: "ETH destination address is not a 20-byte EVM address" };
+      }
+      const recipient = ethers.getAddress(tx.destinationAddress);
+      response = await c.executeValue(tx.txId, recipient, toHexBytes(tx.payload), tx.requestedAmountWei ?? "0");
+    } else {
+      response = await c.execute(tx.txId, toHexBytes(tx.payload));
+    }
     const receipt = await response.wait();
     if (!receipt || receipt.status !== 1) {
       return { success: false, errorMessage: "Destination transaction reverted" };
     }
     const latencyMs = Date.now() - start;
     log.info({ txId: tx.txId, destTxHash: receipt.hash, latencyMs }, "Executed on destination chain");
-    return { success: true, destTxHash: receipt.hash, latencyMs };
+    return {
+      success: true,
+      destTxHash: receipt.hash,
+      latencyMs,
+      transferredAmountWei: tx.transferMode === "ETH_TRANSFER" ? (tx.requestedAmountWei ?? "0") : undefined,
+    };
   } catch (err) {
     const msg = (err as { shortMessage?: string }).shortMessage ?? (err as Error).message;
     log.warn({ txId: tx.txId, msg }, "EVM destination execution failed");

@@ -73,13 +73,14 @@ async function main() {
 
   const db = await getDb();
   const sourceAdapter = new EvmSourceAdapter();
+  const savedCursor = await db.getListenerCursor(LISTENER_ID);
 
   let connected = false;
   let reconnectAttempts = 0;
 
   const connect = async () => {
     try {
-      await sourceAdapter.connect();
+      await sourceAdapter.connect(savedCursor ?? undefined);
       connected = true;
       reconnectAttempts = 0;
       log.info("Source chain connected");
@@ -93,6 +94,9 @@ async function main() {
   };
 
   await connect();
+  if (sourceAdapter.didResetCursor()) {
+    await db.resetListenerCursor(LISTENER_ID);
+  }
 
   // Step 2: confirm completion by watching the destination chain's InterChainCompleted event
   let destWatcher: DestinationWatcher | null = null;
@@ -124,6 +128,11 @@ async function main() {
       // Contract emits seconds; store milliseconds for consistent UI/API timestamps
       sourceTimestamp:     Number(event.timestamp) * 1000,
       sourceBlockNumber:   event.blockNumber,
+      sourceTransactionHash: event.transactionHash,
+      sourceBlockHash: event.blockHash,
+      transferMode:      event.amount > 0n ? "ETH_TRANSFER" : "MESSAGE_ONLY",
+      requestedAmountWei: event.amount.toString(),
+      sourceValueWei:    event.amount.toString(),
       status:              "PENDING",
       createdAt:           Date.now(),
       updatedAt:           Date.now(),
@@ -214,7 +223,11 @@ async function main() {
   // ── Start listening ────────────────────────────────────────────────────────
 
   if (connected) {
-    await sourceAdapter.listen(onEvent, onCancel);
+    await sourceAdapter.listen(
+      onEvent,
+      onCancel,
+      (blockNumber) => db.advanceListenerCursor(LISTENER_ID, blockNumber).then(() => undefined),
+    );
   }
 
   // ── Heartbeat ──────────────────────────────────────────────────────────────
