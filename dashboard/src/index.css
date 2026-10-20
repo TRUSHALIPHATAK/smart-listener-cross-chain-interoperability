@@ -1242,6 +1242,28 @@ textarea::placeholder {
 .transaction-result { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 .transaction-result p { margin: 0; }
 
+.sepolia-page { display: flex; flex-direction: column; gap: 24px; }
+.sepolia-notice {
+  padding: 14px 16px;
+  border: 1px solid #f0d79c;
+  border-radius: 10px;
+  background: #fff8df;
+  color: #765409;
+}
+.sepolia-grid { display: grid; grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr); gap: 24px; }
+.wallet-summary, .sepolia-result-grid { display: grid; gap: 12px; }
+.wallet-summary > div, .sepolia-result-grid > div {
+  display: flex; justify-content: space-between; gap: 14px; padding: 10px 0;
+  border-bottom: 1px solid #f9dce6;
+}
+.wallet-summary span, .sepolia-result-grid span { color: var(--color-text-muted); }
+.wallet-summary strong, .sepolia-result-grid strong, .sepolia-result-grid a { text-align: right; overflow-wrap: anywhere; }
+.sepolia-result { margin-bottom: 20px; }
+.sepolia-result-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 16px 0; }
+@media (max-width: 800px) {
+  .sepolia-grid, .sepolia-result-grid { grid-template-columns: 1fr; }
+}
+
 .message { margin: 14px 0 0; }
 
 /* ---------- Footer ---------- */

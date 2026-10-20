@@ -14,13 +14,17 @@ import {
   DESTINATION_RECEIVER_ADDRESS,
   EXECUTOR_MNEMONIC,
   LISTENER_ID,
+  SOURCE_CHAIN_ID,
+  DEST_CHAIN_ID,
 } from "../config";
+import { getDb } from "../db";
+import { transactionDigest } from "../digest";
 
 const log = childLogger("evmDestinationAdapter");
 
 const RECEIVER_ABI = [
-  "function execute(bytes32 sourceTxId, bytes payload)",
-  "function executeValue(bytes32 sourceTxId, address recipient, bytes payload, uint256 amount)",
+  "function execute(bytes32 sourceTxId, bytes32 destinationChainId, bytes payload, uint256 nonce, uint256 deadline, bytes[] signatures)",
+  "function executeValue(bytes32 sourceTxId, bytes32 destinationChainId, address recipient, bytes payload, uint256 amount, uint256 nonce, uint256 deadline, bytes[] signatures)",
   "function wasExecuted(bytes32 txId) view returns (bool)",
   "event InterChainCompleted(bytes32 indexed sourceTxId, address indexed executor, bytes32 payloadHash, uint256 timestamp)",
 ];
@@ -59,14 +63,21 @@ export async function evmExecute(tx: CrossChainTransaction): Promise<Destination
     }
 
     let response;
+    const votes = await (await getDb()).getVotes(tx.txId);
+    const digest = transactionDigest(tx, DESTINATION_RECEIVER_ADDRESS, SOURCE_CHAIN_ID, DEST_CHAIN_ID);
+    const signatures = votes
+      .filter((v) => v.vote === "APPROVE" && v.signature && v.digest === digest)
+      .map((v) => v.signature as string);
     if (tx.transferMode === "ETH_TRANSFER") {
       if (!ethers.isHexString(tx.destinationAddress, 20)) {
         return { success: false, errorMessage: "ETH destination address is not a 20-byte EVM address" };
       }
       const recipient = ethers.getAddress(tx.destinationAddress);
-      response = await c.executeValue(tx.txId, recipient, toHexBytes(tx.payload), tx.requestedAmountWei ?? "0");
+      response = await c.executeValue(tx.txId, tx.destinationChainId, recipient, toHexBytes(tx.payload),
+        tx.requestedAmountWei ?? "0", tx.nonce, tx.deadline ?? "0", signatures);
     } else {
-      response = await c.execute(tx.txId, toHexBytes(tx.payload));
+      response = await c.execute(tx.txId, tx.destinationChainId, toHexBytes(tx.payload),
+        tx.nonce, tx.deadline ?? "0", signatures);
     }
     const receipt = await response.wait();
     if (!receipt || receipt.status !== 1) {

@@ -52,8 +52,10 @@ CREATE TABLE IF NOT EXISTS transactions (
   updated_at           INTEGER NOT NULL,
   dest_tx_hash         TEXT,
   error_message        TEXT,
+  rollback_tx_hash     TEXT,
   approve_votes        INTEGER NOT NULL DEFAULT 0,
-  reject_votes         INTEGER NOT NULL DEFAULT 0
+  reject_votes         INTEGER NOT NULL DEFAULT 0,
+  deadline             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS votes (
@@ -62,6 +64,9 @@ CREATE TABLE IF NOT EXISTS votes (
   vote        TEXT NOT NULL,
   reason      TEXT,
   voted_at    INTEGER NOT NULL,
+  signer_address TEXT,
+  signature TEXT,
+  digest TEXT,
   PRIMARY KEY (tx_id, listener_id)
 );
 
@@ -103,6 +108,7 @@ interface DbAdapter {
   recordVote(vote: ListenerVote): Promise<void>;
   getVotes(txId: string): Promise<ListenerVote[]>;
   hasVoted(txId: string, listenerId: ListenerId): Promise<boolean>;
+  getTransactionBySenderNonce(sender: string, nonce: string): Promise<CrossChainTransaction | null>;
 
   upsertHeartbeat(hb: ListenerHeartbeat): Promise<void>;
   getHeartbeats(): Promise<ListenerHeartbeat[]>;
@@ -112,6 +118,7 @@ interface DbAdapter {
 
   /** Transactions that have been PENDING/VOTED longer than cutoffMs */
   getTimedOutTransactions(cutoffMs: number): Promise<CrossChainTransaction[]>;
+  getRollbackCandidates(cutoffMs: number): Promise<CrossChainTransaction[]>;
   /** Average execution latency in ms for EXECUTED txns in last windowMs */
   getAvgLatencyMs(windowMs: number): Promise<number>;
   /** Count of EXECUTED txns in last windowMs */
@@ -131,6 +138,7 @@ function rowToTx(row: any): CrossChainTransaction {
     destinationAddress:  row.destination_address,
     payload:             row.payload,
     nonce:               row.nonce,
+    deadline:            row.deadline ?? undefined,
     sourceTimestamp:     Number(row.source_timestamp),
     sourceBlockNumber:   Number(row.source_block_number),
     sourceTransactionHash: row.source_transaction_hash ?? undefined,
@@ -147,6 +155,7 @@ function rowToTx(row: any): CrossChainTransaction {
     updatedAt:           Number(row.updated_at),
     destTxHash:          row.dest_tx_hash ?? undefined,
     errorMessage:        row.error_message ?? undefined,
+    rollbackTxHash:       row.rollback_tx_hash ?? undefined,
     approveVotes:        Number(row.computed_approve_votes ?? row.approve_votes),
     rejectVotes:         Number(row.computed_reject_votes ?? row.reject_votes),
   };
@@ -160,6 +169,9 @@ function rowToVote(row: any): ListenerVote {
     vote:       row.vote as VoteValue,
     reason:     row.reason ?? undefined,
     votedAt:    Number(row.voted_at),
+    signerAddress: row.signer_address ?? undefined,
+    signature: row.signature ?? undefined,
+    digest: row.digest ?? undefined,
   };
 }
 
@@ -350,8 +362,14 @@ class SqliteAdapter implements DbAdapter {
       ["source_value_wei", "TEXT NOT NULL DEFAULT '0'"],
       ["transferred_amount_wei", "TEXT"],
       ["destination_confirmation", "INTEGER NOT NULL DEFAULT 0"],
+      ["rollback_tx_hash", "TEXT"],
+      ["deadline", "TEXT"],
     ]) {
       if (!columns.includes(name)) this.run(`ALTER TABLE transactions ADD COLUMN ${name} ${definition}`);
+    }
+    const voteColumns = this.queryAll("PRAGMA table_info(votes)").map((row) => row.name);
+    for (const [name, definition] of [["signer_address", "TEXT"], ["signature", "TEXT"], ["digest", "TEXT"]]) {
+      if (!voteColumns.includes(name)) this.run(`ALTER TABLE votes ADD COLUMN ${name} ${definition}`);
     }
   }
 
@@ -363,9 +381,9 @@ class SqliteAdapter implements DbAdapter {
            source_timestamp, source_block_number, status, created_at, updated_at,
            source_transaction_hash, source_block_hash, payload_text, payload_hash,
            transfer_mode, requested_amount_wei, source_value_wei, transferred_amount_wei,
-           destination_confirmation, approve_votes, reject_votes)
+           destination_confirmation, approve_votes, reject_votes, deadline)
         VALUES
-          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(tx_id) DO UPDATE SET
           source_transaction_hash = COALESCE(transactions.source_transaction_hash, excluded.source_transaction_hash),
           source_block_hash = COALESCE(transactions.source_block_hash, excluded.source_block_hash),
@@ -381,7 +399,7 @@ class SqliteAdapter implements DbAdapter {
         tx.sourceBlockHash ?? null, tx.payloadText ?? null, tx.payloadHash ?? null,
         tx.transferMode ?? "MESSAGE_ONLY", tx.requestedAmountWei ?? "0", tx.sourceValueWei ?? "0",
         tx.transferredAmountWei ?? null, tx.destinationConfirmation ? 1 : 0,
-        tx.approveVotes, tx.rejectVotes,
+        tx.approveVotes, tx.rejectVotes, tx.deadline ?? null,
       ]);
     });
   }
@@ -412,11 +430,12 @@ class SqliteAdapter implements DbAdapter {
           status = ?,
           updated_at = ?,
           dest_tx_hash  = COALESCE(?, dest_tx_hash),
+          rollback_tx_hash = COALESCE(?, rollback_tx_hash),
           error_message = COALESCE(?, error_message)
           , destination_confirmation = CASE WHEN ? = 1 THEN 1 ELSE destination_confirmation END
           , transferred_amount_wei = COALESCE(?, transferred_amount_wei)
         WHERE tx_id = ? AND status IN (${marks})
-      `, [to, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null,
+      `, [to, Date.now(), extra?.destTxHash ?? null, extra?.rollbackTxHash ?? null, extra?.errorMessage ?? null,
         extra?.destinationConfirmation ? 1 : 0, extra?.transferredAmountWei ?? null, txId, ...from]);
       return this.db.getRowsModified() > 0;
     });
@@ -460,9 +479,10 @@ class SqliteAdapter implements DbAdapter {
   async recordVote(vote: ListenerVote): Promise<void> {
     await this.withWrite(() => {
       this.run(`
-        INSERT OR REPLACE INTO votes (tx_id, listener_id, vote, reason, voted_at)
-        VALUES (?, ?, ?, ?, ?)
-      `, [vote.txId, vote.listenerId, vote.vote, vote.reason ?? null, vote.votedAt]);
+        INSERT OR REPLACE INTO votes (tx_id, listener_id, vote, reason, voted_at, signer_address, signature, digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [vote.txId, vote.listenerId, vote.vote, vote.reason ?? null, vote.votedAt,
+        vote.signerAddress ?? null, vote.signature ?? null, vote.digest ?? null]);
 
       const agg = this.queryOne(`
         SELECT
@@ -490,6 +510,18 @@ class SqliteAdapter implements DbAdapter {
         [txId, listenerId]
       );
       return !!row;
+    });
+  }
+
+  async getTransactionBySenderNonce(sender: string, nonce: string): Promise<CrossChainTransaction | null> {
+    return this.withRead(() => {
+      const row = this.queryOne(`
+        SELECT t.*,
+          (SELECT COUNT(*) FROM votes v WHERE v.tx_id=t.tx_id AND v.vote='APPROVE') computed_approve_votes,
+          (SELECT COUNT(*) FROM votes v WHERE v.tx_id=t.tx_id AND v.vote='REJECT') computed_reject_votes
+        FROM transactions t WHERE lower(sender)=lower(?) AND nonce=? ORDER BY created_at DESC LIMIT 1
+      `, [sender, nonce]);
+      return row ? rowToTx(row) : null;
     });
   }
 
@@ -542,6 +574,16 @@ class SqliteAdapter implements DbAdapter {
         SELECT * FROM transactions
         WHERE status IN ('PENDING', 'VOTED', 'APPROVED', 'EXECUTING')
           AND created_at < ?
+      `, [cutoff]).map(rowToTx);
+    });
+  }
+
+  async getRollbackCandidates(cutoffMs: number): Promise<CrossChainTransaction[]> {
+    return this.withRead(() => {
+      const cutoff = Date.now() - cutoffMs;
+      return this.queryAll(`
+        SELECT * FROM transactions
+        WHERE status = 'TIMED_OUT' AND created_at < ?
       `, [cutoff]).map(rowToTx);
     });
   }
@@ -615,9 +657,11 @@ class PostgresAdapter implements DbAdapter {
         created_at           BIGINT NOT NULL,
         updated_at           BIGINT NOT NULL,
         dest_tx_hash         TEXT,
+        rollback_tx_hash     TEXT,
         error_message        TEXT,
         approve_votes        INTEGER NOT NULL DEFAULT 0,
-        reject_votes         INTEGER NOT NULL DEFAULT 0
+        reject_votes         INTEGER NOT NULL DEFAULT 0,
+        deadline             TEXT
       );
       CREATE TABLE IF NOT EXISTS votes (
         tx_id       TEXT NOT NULL,
@@ -625,6 +669,9 @@ class PostgresAdapter implements DbAdapter {
         vote        TEXT NOT NULL,
         reason      TEXT,
         voted_at    BIGINT NOT NULL,
+        signer_address TEXT,
+        signature TEXT,
+        digest TEXT,
         PRIMARY KEY (tx_id, listener_id)
       );
       CREATE TABLE IF NOT EXISTS listener_heartbeats (
@@ -651,6 +698,11 @@ class PostgresAdapter implements DbAdapter {
     await this.pool.query("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_value_wei TEXT NOT NULL DEFAULT '0'");
     await this.pool.query("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS transferred_amount_wei TEXT");
     await this.pool.query("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS destination_confirmation BOOLEAN NOT NULL DEFAULT FALSE");
+    await this.pool.query("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS rollback_tx_hash TEXT");
+    await this.pool.query("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS deadline TEXT");
+    await this.pool.query("ALTER TABLE votes ADD COLUMN IF NOT EXISTS signer_address TEXT");
+    await this.pool.query("ALTER TABLE votes ADD COLUMN IF NOT EXISTS signature TEXT");
+    await this.pool.query("ALTER TABLE votes ADD COLUMN IF NOT EXISTS digest TEXT");
   }
 
   async upsertTransaction(tx: CrossChainTransaction): Promise<void> {
@@ -660,8 +712,8 @@ class PostgresAdapter implements DbAdapter {
          source_timestamp, source_block_number, status, created_at, updated_at,
          source_transaction_hash, source_block_hash, payload_text, payload_hash,
          transfer_mode, requested_amount_wei, source_value_wei, transferred_amount_wei,
-         destination_confirmation, approve_votes, reject_votes)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+         destination_confirmation, approve_votes, reject_votes, deadline)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
       ON CONFLICT (tx_id) DO UPDATE SET
         source_transaction_hash = COALESCE(transactions.source_transaction_hash, EXCLUDED.source_transaction_hash),
         source_block_hash = COALESCE(transactions.source_block_hash, EXCLUDED.source_block_hash),
@@ -677,7 +729,7 @@ class PostgresAdapter implements DbAdapter {
       tx.sourceBlockHash ?? null, tx.payloadText ?? null, tx.payloadHash ?? null,
       tx.transferMode ?? "MESSAGE_ONLY", tx.requestedAmountWei ?? "0", tx.sourceValueWei ?? "0",
       tx.transferredAmountWei ?? null, tx.destinationConfirmation ?? false,
-      tx.approveVotes, tx.rejectVotes
+      tx.approveVotes, tx.rejectVotes, tx.deadline ?? null
     ]);
   }
 
@@ -702,11 +754,12 @@ class PostgresAdapter implements DbAdapter {
       UPDATE transactions SET
         status = $1, updated_at = $2,
         dest_tx_hash  = COALESCE($3, dest_tx_hash),
-        error_message = COALESCE($4, error_message)
-        , destination_confirmation = CASE WHEN $6 = TRUE THEN TRUE ELSE destination_confirmation END
-        , transferred_amount_wei = COALESCE($7, transferred_amount_wei)
-      WHERE tx_id = $5 AND status = ANY($8::text[])
-    `, [to, Date.now(), extra?.destTxHash ?? null, extra?.errorMessage ?? null,
+        rollback_tx_hash = COALESCE($4, rollback_tx_hash),
+        error_message = COALESCE($5, error_message)
+        , destination_confirmation = CASE WHEN $7 = TRUE THEN TRUE ELSE destination_confirmation END
+        , transferred_amount_wei = COALESCE($8, transferred_amount_wei)
+      WHERE tx_id = $6 AND status = ANY($9::text[])
+    `, [to, Date.now(), extra?.destTxHash ?? null, extra?.rollbackTxHash ?? null, extra?.errorMessage ?? null,
       txId, extra?.destinationConfirmation ?? false, extra?.transferredAmountWei ?? null, from]);
     return (r.rowCount ?? 0) > 0;
   }
@@ -743,10 +796,12 @@ class PostgresAdapter implements DbAdapter {
 
   async recordVote(vote: ListenerVote): Promise<void> {
     await this.pool.query(`
-      INSERT INTO votes (tx_id, listener_id, vote, reason, voted_at)
-      VALUES ($1,$2,$3,$4,$5)
-      ON CONFLICT (tx_id, listener_id) DO UPDATE SET vote = $3, reason = $4, voted_at = $5
-    `, [vote.txId, vote.listenerId, vote.vote, vote.reason ?? null, vote.votedAt]);
+      INSERT INTO votes (tx_id, listener_id, vote, reason, voted_at, signer_address, signature, digest)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (tx_id, listener_id) DO UPDATE SET vote = $3, reason = $4, voted_at = $5,
+        signer_address = $6, signature = $7, digest = $8
+    `, [vote.txId, vote.listenerId, vote.vote, vote.reason ?? null, vote.votedAt,
+      vote.signerAddress ?? null, vote.signature ?? null, vote.digest ?? null]);
 
     const agg = await this.pool.query(`
       SELECT
@@ -768,6 +823,16 @@ class PostgresAdapter implements DbAdapter {
   async hasVoted(txId: string, listenerId: ListenerId): Promise<boolean> {
     const r = await this.pool.query("SELECT 1 FROM votes WHERE tx_id = $1 AND listener_id = $2", [txId, listenerId]);
     return r.rows.length > 0;
+  }
+
+  async getTransactionBySenderNonce(sender: string, nonce: string): Promise<CrossChainTransaction | null> {
+    const r = await this.pool.query(`
+      SELECT t.*,
+        (SELECT COUNT(*) FROM votes v WHERE v.tx_id=t.tx_id AND v.vote='APPROVE') computed_approve_votes,
+        (SELECT COUNT(*) FROM votes v WHERE v.tx_id=t.tx_id AND v.vote='REJECT') computed_reject_votes
+      FROM transactions t WHERE lower(sender)=lower($1) AND nonce=$2 ORDER BY created_at DESC LIMIT 1
+    `, [sender, nonce]);
+    return r.rows[0] ? rowToTx(r.rows[0]) : null;
   }
 
   async upsertHeartbeat(hb: ListenerHeartbeat): Promise<void> {
@@ -810,6 +875,15 @@ class PostgresAdapter implements DbAdapter {
     const r = await this.pool.query(`
       SELECT * FROM transactions
       WHERE status IN ('PENDING','VOTED','APPROVED','EXECUTING') AND created_at < $1
+    `, [cutoff]);
+    return r.rows.map(rowToTx);
+  }
+
+  async getRollbackCandidates(cutoffMs: number): Promise<CrossChainTransaction[]> {
+    const cutoff = Date.now() - cutoffMs;
+    const r = await this.pool.query(`
+      SELECT * FROM transactions
+      WHERE status = 'TIMED_OUT' AND created_at < $1
     `, [cutoff]);
     return r.rows.map(rowToTx);
   }

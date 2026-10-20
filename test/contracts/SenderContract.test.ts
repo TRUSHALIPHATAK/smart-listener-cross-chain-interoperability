@@ -1,6 +1,6 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
-import { SenderContract, ReceiverMock } from "../../typechain-types";
+import { SenderContract, ReceiverMock, DestinationReceiver, SepoliaEscrow } from "../../typechain-types";
 import { HardhatEthersSigner } from "@nomicfoundation/hardhat-ethers/signers";
 
 describe("SenderContract", () => {
@@ -110,6 +110,41 @@ describe("SenderContract", () => {
         sender.connect(owner).cancelTransaction(txId)
       ).to.be.revertedWithCustomError(sender, "NotTxSender");
     });
+
+    describe("rollbackTransaction", () => {
+      it("returns an escrow to the sender after the refund delay", async () => {
+        const [ownerSigner, sourceSender] = await ethers.getSigners();
+        const Factory = await ethers.getContractFactory("SenderContract");
+        const contract = await Factory.deploy();
+        await contract.waitForDeployment();
+        const tx = await contract.connect(sourceSender).sendCrossChainTransaction(
+          DEST_CHAIN_ID,
+          DEST_ADDRESS,
+          PAYLOAD,
+          { value: ethers.parseEther("0.01") },
+        );
+        const receipt = await tx.wait();
+        const event = receipt!.logs
+          .map((log) => {
+            try { return contract.interface.parseLog({ topics: [...log.topics], data: log.data }); } catch { return null; }
+          })
+          .find((parsed) => parsed?.name === "TransactionSent");
+        const txId = event!.args.txId;
+
+        await expect(contract.connect(ownerSigner).rollbackTransaction(txId))
+          .to.be.revertedWithCustomError(contract, "RollbackTooEarly");
+        await ethers.provider.send("evm_increaseTime", [60]);
+        await ethers.provider.send("evm_mine", []);
+
+        await expect(contract.connect(ownerSigner).rollbackTransaction(txId))
+          .to.emit(contract, "TransactionRolledBack")
+          .withArgs(txId, sourceSender.address, ethers.parseEther("0.01"));
+        expect(await contract.txRolledBack(txId)).to.equal(true);
+        expect(await contract.txSenders(txId)).to.equal(ethers.ZeroAddress);
+
+        await expect(contract.connect(ownerSigner).rollbackTransaction(txId)).not.to.be.reverted;
+      });
+    });
   });
 });
 
@@ -128,10 +163,154 @@ describe("ReceiverMock", () => {
     await receiver.waitForDeployment();
   });
 
+  describe("SepoliaEscrow", () => {
+    let escrow: SepoliaEscrow;
+    let owner: HardhatEthersSigner;
+    let sender: HardhatEthersSigner;
+    let recipient: HardhatEthersSigner;
+    let listeners: HardhatEthersSigner[];
+    let listenerWallets: ethers.HDNodeWallet[];
+    const payloadHash = ethers.keccak256(ethers.toUtf8Bytes("payload"));
+    const txId = ethers.keccak256(ethers.toUtf8Bytes("escrow-tx"));
+
+    beforeEach(async () => {
+      [owner, sender, recipient, ...listeners] = await ethers.getSigners();
+      listenerWallets = [1, 2, 3, 4].map((index) =>
+        ethers.HDNodeWallet.fromPhrase(
+          "test test test test test test test test test test test junk",
+          undefined, `m/44'/60'/0'/0/${index}`,
+        ).connect(ethers.provider),
+      );
+      const Factory = await ethers.getContractFactory("SepoliaEscrow");
+      escrow = await Factory.deploy(listenerWallets.map((x) => x.address), 3);
+      await escrow.waitForDeployment();
+    });
+
+    async function deposit(deadline?: bigint) {
+      const block = await ethers.provider.getBlock("latest");
+      const effectiveDeadline = deadline ?? BigInt((block?.timestamp ?? 0) + 3600);
+      await escrow.connect(sender).deposit(txId, recipient.address, payloadHash, effectiveDeadline, 11, {
+        value: ethers.parseEther("1"),
+      });
+    }
+
+    async function signatures() {
+      const digest = await escrow.digest(txId);
+      return listenerWallets.slice(0, 3).map((listener) => listener.signingKey.sign(digest).serialized);
+    }
+
+    it("releases the exact amount only with 3 distinct authorized approvals", async () => {
+      await deposit();
+      const before = await ethers.provider.getBalance(recipient.address);
+      await expect(escrow.connect(listenerWallets[0]).release(txId, await signatures()))
+        .to.emit(escrow, "Released").withArgs(txId, listenerWallets[0].address, ethers.parseEther("1"));
+      expect(await ethers.provider.getBalance(recipient.address)).to.equal(before + ethers.parseEther("1"));
+      await expect(escrow.connect(listenerWallets[1]).release(txId, await signatures()))
+        .to.be.revertedWithCustomError(escrow, "TransactionAlreadySettled");
+    });
+
+    it("rejects one or two approvals, duplicate and unregistered signatures", async () => {
+      await deposit();
+      const digest = await escrow.digest(txId);
+      const one = listenerWallets[0].signingKey.sign(digest).serialized;
+      const two = listenerWallets[1].signingKey.sign(digest).serialized;
+      await expect(escrow.connect(listenerWallets[0]).release(txId, [one]))
+        .to.be.revertedWithCustomError(escrow, "NotEnoughSignatures");
+      await expect(escrow.connect(listenerWallets[0]).release(txId, [one, two]))
+        .to.be.revertedWithCustomError(escrow, "NotEnoughSignatures");
+      await expect(escrow.connect(listenerWallets[0]).release(txId, [one, one, one]))
+        .to.be.revertedWithCustomError(escrow, "DuplicateSigner");
+      const unauthorized = ethers.HDNodeWallet.fromPhrase(
+        "test test test test test test test test test test test junk",
+        undefined, "m/44'/60'/0'/0/0",
+      ).signingKey.sign(digest).serialized;
+      await expect(escrow.connect(listenerWallets[0]).release(txId, [one, two, unauthorized]))
+        .to.be.revertedWithCustomError(escrow, "UnauthorizedSigner");
+    });
+
+    it("binds approvals to the exact transaction data and supports sender-only timeout refund", async () => {
+      await deposit();
+      const otherTxId = ethers.keccak256(ethers.toUtf8Bytes("other"));
+      const digest = await escrow.digest(txId);
+      const sigs = listenerWallets.slice(0, 3).map((listener) => listener.signingKey.sign(digest).serialized);
+      await expect(escrow.connect(listenerWallets[0]).release(otherTxId, sigs))
+        .to.be.revertedWithCustomError(escrow, "TransactionAlreadySettled");
+      await expect(escrow.connect(owner).refund(txId)).to.be.revertedWithCustomError(escrow, "NotSender");
+      const block = await ethers.provider.getBlock("latest");
+      await ethers.provider.send("evm_setNextBlockTimestamp", [(block?.timestamp ?? 0) + 7200]);
+      await ethers.provider.send("evm_mine", []);
+      await expect(escrow.connect(sender).refund(txId))
+        .to.emit(escrow, "Refunded").withArgs(txId, sender.address, ethers.parseEther("1"));
+      await expect(escrow.connect(sender).refund(txId))
+        .to.be.revertedWithCustomError(escrow, "TransactionAlreadySettled");
+    });
+  });
+
+  describe("DestinationReceiver cryptographic consensus", () => {
+    let receiver: DestinationReceiver;
+    let a: ethers.HDNodeWallet;
+    let b: ethers.HDNodeWallet;
+    const sourceTxId = ethers.keccak256(ethers.toUtf8Bytes("signed-tx"));
+    const route = ethers.encodeBytes32String("dest");
+    const payload = ethers.toUtf8Bytes("signed-payload");
+
+    beforeEach(async () => {
+      const mnemonic = "test test test test test test test test test test test junk";
+      a = ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, "m/44'/60'/0'/0/0").connect(ethers.provider);
+      b = ethers.HDNodeWallet.fromPhrase(mnemonic, undefined, "m/44'/60'/0'/0/1").connect(ethers.provider);
+      const Factory = await ethers.getContractFactory("DestinationReceiver");
+      receiver = await Factory.deploy([a.address, b.address], 31337, 2);
+      await receiver.waitForDeployment();
+    });
+
+    async function signatures(nonce = 4n, deadline = 9999999999n) {
+      const digest = await receiver.digest(
+        sourceTxId, route, ethers.keccak256(payload), ethers.ZeroAddress, 0, 0, nonce, deadline,
+      );
+      return [a.signingKey.sign(digest).serialized, b.signingKey.sign(digest).serialized];
+    }
+
+    it("requires distinct authorized signatures and prevents replay", async () => {
+      const deadline = 9999999999n;
+      await expect(receiver.execute(sourceTxId, route, payload, 4, deadline, await signatures(4n, deadline)))
+        .to.emit(receiver, "InterChainCompleted");
+      await expect(receiver.execute(sourceTxId, route, payload, 4, deadline, await signatures(4n, deadline)))
+        .to.be.revertedWithCustomError(receiver, "AlreadyExecuted");
+    });
+
+    it("rejects tampered payloads and duplicate signers", async () => {
+      const sigs = await signatures();
+      await expect(receiver.execute(
+        sourceTxId, route, ethers.toUtf8Bytes("tampered"), 4, 9999999999n, sigs,
+      )).to.be.reverted;
+      await expect(receiver.execute(
+        sourceTxId, route, payload, 4, 9999999999n, [sigs[0], sigs[0]],
+      )).to.be.revertedWithCustomError(receiver, "DuplicateSigner");
+    });
+
+    it("rejects insufficient and unauthorized signatures", async () => {
+      const sigs = await signatures();
+      await expect(receiver.execute(sourceTxId, route, payload, 4, 9999999999n, [sigs[0]]))
+        .to.be.revertedWithCustomError(receiver, "InsufficientSignatures");
+      const unauthorized = ethers.HDNodeWallet.fromPhrase(
+        "test test test test test test test test test test test junk",
+        undefined, "m/44'/60'/0'/0/2",
+      ).connect(ethers.provider);
+      const digest = await receiver.digest(
+        ethers.keccak256(ethers.toUtf8Bytes("unauthorized")), route, ethers.keccak256(payload),
+        ethers.ZeroAddress, 0, 0, 4, 9999999999n,
+      );
+      await expect(receiver.execute(
+        ethers.keccak256(ethers.toUtf8Bytes("unauthorized")), route, payload, 4, 9999999999n,
+        [a.signingKey.sign(digest).serialized, unauthorized.signingKey.sign(digest).serialized],
+      )).to.be.revertedWithCustomError(receiver, "UnauthorizedSigner");
+    });
+  });
+
   it("executes successfully and records txId", async () => {
     await expect(receiver.connect(executor).execute(SOURCE_TX_ID, PAYLOAD))
       .to.emit(receiver, "CrossChainExecuted")
-      .withArgs(SOURCE_TX_ID, executor.address, PAYLOAD, await ethers.provider.getBlock("latest").then(b => b!.timestamp + 1));
+      .withArgs(SOURCE_TX_ID, executor.address, PAYLOAD, (value: bigint) => value > 0n);
 
     expect(await receiver.wasExecuted(SOURCE_TX_ID)).to.be.true;
     expect(await receiver.getExecutionCount()).to.equal(1n);

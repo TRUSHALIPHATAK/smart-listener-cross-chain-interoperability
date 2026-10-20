@@ -10,16 +10,56 @@
 import { ethers } from "ethers";
 import { DbAdapter } from "./db";
 import { childLogger } from "./logger";
-import { DEST_CHAIN_ID, DEST_RPC_URL, DESTINATION_RECEIVER_ADDRESS, POLL_INTERVAL_MS, SOURCE_RPC_URL, SENDER_CONTRACT_ADDRESS, OWNER_MNEMONIC } from "./config";
+import { DEST_CHAIN_ID, DEST_RPC_URL, DESTINATION_RECEIVER_ADDRESS, DESTINATION_ROUTE_ID, POLL_INTERVAL_MS, SOURCE_RPC_URL, SENDER_CONTRACT_ADDRESS, OWNER_MNEMONIC } from "./config";
 
 const log = childLogger("destinationWatcher");
 
 const ABI = [
   "event InterChainCompleted(bytes32 indexed sourceTxId, address indexed executor, bytes32 payloadHash, uint256 timestamp, address recipient, uint256 amount)",
 ];
-const SOURCE_ABI = ["function finalizeTransaction(bytes32 txId)"];
+const SOURCE_ABI = [
+  "function txSenders(bytes32) view returns (address)",
+  "function txFinalized(bytes32) view returns (bool)",
+  "function txRefunded(bytes32) view returns (bool)",
+  "function txRolledBack(bytes32) view returns (bool)",
+  "function finalizeTransaction(bytes32 txId)",
+];
 
-export type CompletionOutcome = "confirmed" | "late" | "ignored";
+export type CompletionOutcome = "confirmed" | "late" | "ignored" | "invalid";
+
+export interface CompletionEvent {
+  txId: string;
+  destTxHash: string;
+  payloadHash: string;
+  recipient: string;
+  amountWei: string;
+  blockNumber?: number;
+}
+
+function expectedRouteId(): string {
+  return ethers.encodeBytes32String(DESTINATION_ROUTE_ID.slice(0, 31));
+}
+
+function isExpectedRecipient(tx: Awaited<ReturnType<DbAdapter["getTransaction"]>>, recipient: string): boolean {
+  if (!tx || tx.transferMode !== "ETH_TRANSFER") return recipient === ethers.ZeroAddress;
+  if (!ethers.isHexString(tx.destinationAddress, 20)) return false;
+  return ethers.getAddress(tx.destinationAddress) === ethers.getAddress(recipient);
+}
+
+async function finalizeSourceEscrow(tx: NonNullable<Awaited<ReturnType<DbAdapter["getTransaction"]>>>): Promise<void> {
+  if (tx.transferMode !== "ETH_TRANSFER") return;
+  const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
+  const read = new ethers.Contract(SENDER_CONTRACT_ADDRESS, SOURCE_ABI, provider);
+  if (Boolean(await read.txFinalized(tx.txId)) || Boolean(await read.txRefunded(tx.txId)) || Boolean(await read.txRolledBack(tx.txId))) {
+    return;
+  }
+  if (String(await read.txSenders(tx.txId)) === ethers.ZeroAddress) return;
+  const wallet = ethers.HDNodeWallet.fromPhrase(OWNER_MNEMONIC).connect(provider);
+  const source = new ethers.Contract(SENDER_CONTRACT_ADDRESS, SOURCE_ABI, new ethers.NonceManager(wallet));
+  const finalization = await source.finalizeTransaction(tx.txId);
+  const receipt = await finalization.wait();
+  if (!receipt || receipt.status !== 1) throw new Error(`Source finalization failed for ${tx.txId}`);
+}
 
 /**
  * Apply one InterChainCompleted event to the DB.
@@ -30,23 +70,31 @@ export type CompletionOutcome = "confirmed" | "late" | "ignored";
  */
 export async function handleCompleted(
   db: DbAdapter,
-  txId: string,
-  destTxHash: string,
-  amountWei = "0",
+  completion: CompletionEvent,
 ): Promise<CompletionOutcome> {
+  const { txId, destTxHash, amountWei } = completion;
   const tx = await db.getTransaction(txId);
-  const changed = await db.transitionStatus(txId, ["APPROVED", "EXECUTING"], "EXECUTED", {
+  if (!tx) return "ignored";
+  if (
+    completion.payloadHash !== ethers.keccak256(tx.payload) ||
+    !isExpectedRecipient(tx, completion.recipient) ||
+    (tx.transferMode === "ETH_TRANSFER"
+      ? amountWei !== (tx.requestedAmountWei ?? "0")
+      : amountWei !== "0") ||
+    (tx.destinationChainId !== expectedRouteId())
+  ) {
+    log.warn({ txId, destTxHash }, "Ignoring destination completion with mismatched transaction data");
+    return "invalid";
+  }
+
+  const changed = await db.transitionStatus(txId, ["APPROVED", "EXECUTING", "TIMED_OUT"], "EXECUTED", {
     destTxHash,
     destinationConfirmation: true,
     transferredAmountWei: amountWei !== "0" ? amountWei : undefined,
   });
-  if (changed && tx?.transferMode === "ETH_TRANSFER") {
+  if (changed || tx.status === "EXECUTED") {
     try {
-      const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
-      const wallet = ethers.HDNodeWallet.fromPhrase(OWNER_MNEMONIC).connect(provider);
-      const source = new ethers.Contract(SENDER_CONTRACT_ADDRESS, SOURCE_ABI, new ethers.NonceManager(wallet));
-      const finalization = await source.finalizeTransaction(txId);
-      await finalization.wait();
+      await finalizeSourceEscrow(tx);
     } catch (err) {
       log.warn({ txId, err }, "Destination confirmed but source escrow finalization failed");
     }
@@ -54,7 +102,9 @@ export async function handleCompleted(
   if (changed) return "confirmed";
   const current = await db.getTransaction(txId);
   if (!current) return "ignored";
+  if (current.status === "ROLLED_BACK") return "late";
   if (current.status === "TIMED_OUT") return "late";
+  if (current.status === "EXECUTED") return "ignored";
   return "ignored";
 }
 
@@ -80,6 +130,32 @@ export class DestinationWatcher {
 
   getLastBlock(): number {
     return this.lastBlock;
+  }
+
+  async reconcile(txId: string): Promise<CompletionOutcome> {
+    const { provider, contract } = this.ensure();
+    const network = await provider.getNetwork();
+    if (Number(network.chainId) !== DEST_CHAIN_ID) {
+      throw new Error(`Destination RPC chain ID ${network.chainId} does not match configured ${DEST_CHAIN_ID}`);
+    }
+    const latest = await provider.getBlockNumber();
+    const logs = await contract.queryFilter(contract.filters.InterChainCompleted(txId), 0, latest);
+    for (const entry of logs) {
+      if (!("args" in entry)) continue;
+      const receipt = await provider.getTransactionReceipt(entry.transactionHash);
+      if (!receipt || receipt.status !== 1 || entry.address.toLowerCase() !== DESTINATION_RECEIVER_ADDRESS.toLowerCase()) {
+        continue;
+      }
+      return handleCompleted(this.db, {
+        txId: String(entry.args[0]),
+        destTxHash: entry.transactionHash,
+        payloadHash: String(entry.args[2]),
+        recipient: String(entry.args[4]),
+        amountWei: String(entry.args[5]),
+        blockNumber: entry.blockNumber,
+      });
+    }
+    return "ignored";
   }
 
   private ensure(): { provider: ethers.JsonRpcProvider; contract: ethers.Contract } {
@@ -117,12 +193,20 @@ export class DestinationWatcher {
         for (const entry of logs) {
           if (!("args" in entry)) continue;
           const txId = String(entry.args[0]);
-          const amount = "args" in entry ? String(entry.args[5] ?? 0) : "0";
-          const outcome = await handleCompleted(this.db, txId, entry.transactionHash, amount);
+          const receipt = await provider.getTransactionReceipt(entry.transactionHash);
+          if (!receipt || receipt.status !== 1 || entry.address.toLowerCase() !== DESTINATION_RECEIVER_ADDRESS.toLowerCase()) continue;
+          const outcome = await handleCompleted(this.db, {
+            txId,
+            destTxHash: entry.transactionHash,
+            payloadHash: String(entry.args[2]),
+            recipient: String(entry.args[4]),
+            amountWei: String(entry.args[5]),
+            blockNumber: entry.blockNumber,
+          });
           if (outcome === "confirmed") {
             log.info({ txId, destTxHash: entry.transactionHash, block: entry.blockNumber }, "InterChainCompleted seen - transaction EXECUTED");
-          } else if (outcome === "late") {
-            log.warn({ txId, destTxHash: entry.transactionHash }, "Destination completed AFTER timeout - source/destination diverged (needs rollback)");
+          } else if (outcome === "late" || outcome === "invalid") {
+            log.warn({ txId, destTxHash: entry.transactionHash, outcome }, "Destination completion was not applied to the current settlement state");
           }
         }
         this.lastBlock = to;

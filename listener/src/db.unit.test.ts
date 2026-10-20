@@ -210,4 +210,23 @@ describe("SqliteAdapter (sql.js)", () => {
     await db.resetListenerCursor("A");
     expect(await db.getListenerCursor("A")).toBeNull();
   });
+
+  it("returns only timed-out transactions eligible for rollback", async () => {
+    await db.upsertTransaction({
+      txId: "0xrollback-candidate", sender: "0xS", destinationChainId: "0xd",
+      destinationAddress: "0xa", payload: "0x01", nonce: "1", sourceTimestamp: 1,
+      sourceBlockNumber: 1, status: "TIMED_OUT", createdAt: Date.now() - 10_000,
+      updatedAt: Date.now() - 10_000, approveVotes: 0, rejectVotes: 0,
+    });
+    await db.upsertTransaction({
+      txId: "0xrollback-new", sender: "0xS", destinationChainId: "0xd",
+      destinationAddress: "0xa", payload: "0x01", nonce: "2", sourceTimestamp: 1,
+      sourceBlockNumber: 1, status: "TIMED_OUT", createdAt: Date.now(),
+      updatedAt: Date.now(), approveVotes: 0, rejectVotes: 0,
+    });
+    expect((await db.getRollbackCandidates(5_000)).map((tx) => tx.txId))
+      .toContain("0xrollback-candidate");
+    expect((await db.getRollbackCandidates(5_000)).map((tx) => tx.txId))
+      .not.toContain("0xrollback-new");
+  });
 });

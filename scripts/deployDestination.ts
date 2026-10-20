@@ -18,7 +18,7 @@ async function main() {
   console.log("Executors (A-D):", executors.join(", "));
 
   const Factory = await ethers.getContractFactory("DestinationReceiver");
-  const receiver = await Factory.deploy(executors);
+  const receiver = await Factory.deploy(executors, 31337, 3);
   await receiver.waitForDeployment();
   const address = await receiver.getAddress();
   console.log("DestinationReceiver deployed at:", address);

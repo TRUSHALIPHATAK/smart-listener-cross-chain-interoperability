@@ -5,6 +5,7 @@
  *   PENDING → VOTED → APPROVED → EXECUTING → EXECUTED
  *                                           → FAILED
  *                                           → TIMED_OUT
+ *                                           → ROLLED_BACK
  *   PENDING → REJECTED  (if cancelled on source or validation fails)
  */
 
@@ -39,6 +40,7 @@ export interface CrossChainTransaction {
   payload: string;
   /** Per-sender nonce */
   nonce: string;
+  deadline?: string;
   /** Block timestamp of source event (milliseconds since epoch) */
   sourceTimestamp: number;
   /** Block number of source event */
@@ -62,6 +64,9 @@ export interface CrossChainTransaction {
   updatedAt: number;
   /** Transaction hash of destination execution (if EXECUTED) */
   destTxHash?: string;
+  /** Source-chain rollback transaction hash, when escrow was rolled back */
+  rollbackTxHash?: string;
+  escrowContractAddress?: string;
   /** Error message (if FAILED) */
   errorMessage?: string;
   /** Number of approve votes received so far */
@@ -77,6 +82,9 @@ export interface ListenerVote {
   /** Reason string (for REJECT votes especially) */
   reason?: string;
   votedAt: number;
+  signerAddress?: string;
+  signature?: string;
+  digest?: string;
 }
 
 export interface ListenerHeartbeat {
@@ -95,10 +103,13 @@ export interface TransactionEvent {
   payload: string;
   nonce: bigint;
   timestamp: bigint;
+  deadline: bigint;
   blockNumber: number;
   blockHash: string;
   transactionHash: string;
   amount: bigint;
+  payloadHash?: string;
+  sourceContractAddress?: string;
 }
 
 export interface DestinationResult {

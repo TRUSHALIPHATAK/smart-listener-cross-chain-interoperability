@@ -160,7 +160,7 @@ const steps: { icon: IconName; title: string; body: string }[] = [
   {
     icon: "shield",
     title: "Safety Guarantees",
-    body: "Replay protection prevents a transaction from being executed twice. Timeout sweeping marks stuck transactions as TIMED_OUT. Duplicate-vote prevention ensures each listener votes exactly once. No cross-chain atomicity or rollback is claimed.",
+    body: "Replay protection prevents a transaction from being executed twice. Destination completion is reconciled before timeout settlement, and source escrow can be safely rolled back after the configured backup window.",
   },
 ];
 

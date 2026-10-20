@@ -7,6 +7,7 @@
  */
 
 import { LISTENER_IDS, ListenerVote, VoteValue } from "./types";
+import { ethers } from "ethers";
 
 export interface ConsensusResult {
   approved: boolean;
@@ -56,7 +57,8 @@ export function validateVote(
   txId: string,
   listenerId: string,
   vote: VoteValue,
-  existingVotes: ListenerVote[]
+  existingVotes: ListenerVote[],
+  signed?: Pick<ListenerVote, "signerAddress" | "signature" | "digest">
 ): string | null {
   if (!txId || typeof txId !== "string") return "Invalid txId";
   if (!(LISTENER_IDS as readonly string[]).includes(listenerId)) return `Invalid listenerId: ${listenerId}`;
@@ -64,6 +66,18 @@ export function validateVote(
 
   const alreadyVoted = existingVotes.some((v) => v.listenerId === listenerId);
   if (alreadyVoted) return `Listener ${listenerId} has already voted on ${txId}`;
+  if (signed) {
+    if (!signed.signerAddress || !signed.signature || !signed.digest) return "Cryptographic signature fields are required";
+    try {
+      const recovered = ethers.getAddress(ethers.recoverAddress(signed.digest, signed.signature));
+      if (recovered !== ethers.getAddress(signed.signerAddress)) return "Signature does not match signer address";
+    } catch {
+      return "Invalid cryptographic signature";
+    }
+    if (existingVotes.some((v) => v.signerAddress?.toLowerCase() === signed.signerAddress!.toLowerCase())) {
+      return `Signer ${signed.signerAddress} has already voted`;
+    }
+  }
 
   return null; // valid
 }

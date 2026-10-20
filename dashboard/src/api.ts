@@ -63,6 +63,7 @@ export interface Metrics {
   failed: number;
   timedOut: number;
   rejected: number;
+  rolledBack: number;
   avgLatencyMs: number;
   throughputPerMinute: number;
   listeners: ListenerHeartbeat[];

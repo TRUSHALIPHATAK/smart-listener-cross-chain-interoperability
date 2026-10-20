@@ -25,6 +25,14 @@ function optionalInt(key: string, fallback: number): number {
   return n;
 }
 
+function optionalPositiveNumber(key: string, fallback: number): number {
+  const v = process.env[key];
+  if (!v) return fallback;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`Env var ${key} must be a positive number, got: ${v}`);
+  return n;
+}
+
 // ── Listener Identity ─────────────────────────────────────────────────────────
 
 const rawId = optional("LISTENER_ID", "A").toUpperCase();
@@ -35,8 +43,15 @@ export const LISTENER_ID = rawId as ListenerId;
 
 // ── Source Chain ──────────────────────────────────────────────────────────────
 
-export const SOURCE_RPC_URL     = optional("SOURCE_RPC_URL", "http://127.0.0.1:8545");
-export const SOURCE_CHAIN_ID    = optionalInt("SOURCE_CHAIN_ID", 31337);
+export const SOURCE_MODE        = optional("SOURCE_MODE", "hardhat") as "hardhat" | "sepolia";
+export const SEPOLIA_RPC_URL    = optional("SEPOLIA_RPC_URL", "");
+export const SEPOLIA_CHAIN_ID   = optionalInt("SEPOLIA_CHAIN_ID", 11155111);
+export const SOURCE_RPC_URL     = SOURCE_MODE === "sepolia"
+  ? required("SEPOLIA_RPC_URL")
+  : optional("SOURCE_RPC_URL", "http://127.0.0.1:8545");
+export const SOURCE_CHAIN_ID    = SOURCE_MODE === "sepolia"
+  ? SEPOLIA_CHAIN_ID
+  : optionalInt("SOURCE_CHAIN_ID", 31337);
 export const POLL_INTERVAL_MS   = optionalInt("POLL_INTERVAL_MS", 2000);
 /** First block to scan on startup (0 = replay from genesis; safe because votes are idempotent) */
 export const START_BLOCK        = optionalInt("START_BLOCK", 0);
@@ -44,7 +59,7 @@ export const CONFIRMATIONS      = optionalInt("CONFIRMATIONS", 1);
 
 // ── Contract Addresses ────────────────────────────────────────────────────────
 
-function loadDeployment(): { SenderContract: string; ReceiverMock: string; DestinationReceiver?: string } {
+function loadDeployment(): { SenderContract: string; ReceiverMock: string; DestinationReceiver?: string; SepoliaEscrow?: string } {
   const deployPath = path.join(__dirname, "..", "config", "deployment.json");
   if (fs.existsSync(deployPath)) {
     const data = JSON.parse(fs.readFileSync(deployPath, "utf8"));
@@ -55,6 +70,7 @@ function loadDeployment(): { SenderContract: string; ReceiverMock: string; Desti
     SenderContract: optional("SENDER_CONTRACT_ADDRESS", ""),
     ReceiverMock:   optional("RECEIVER_MOCK_ADDRESS",   ""),
     DestinationReceiver: optional("DESTINATION_RECEIVER_ADDRESS", ""),
+    SepoliaEscrow: optional("SEPOLIA_ESCROW_ADDRESS", ""),
   };
 }
 
@@ -106,11 +122,40 @@ export const SQLITE_PATH        = optional("SQLITE_PATH", path.join(__dirname, "
 export const DESTINATION_TYPE   = optional("DESTINATION_TYPE", "evm") as "evm" | "simulated" | "fabric";
 export const DEST_RPC_URL       = optional("DEST_RPC_URL", "http://127.0.0.1:8546");
 export const DEST_CHAIN_ID      = optionalInt("DEST_CHAIN_ID", 31338);
+export const DESTINATION_ROUTE_ID = optional("DESTINATION_ROUTE_ID", "simulated-evm-chain");
 export const DESTINATION_RECEIVER_ADDRESS: string =
   process.env.DESTINATION_RECEIVER_ADDRESS ?? deployment.DestinationReceiver ?? "";
+export const SEPOLIA_ESCROW_ADDRESS: string =
+  process.env.SEPOLIA_ESCROW_ADDRESS ?? deployment.SepoliaEscrow ?? "";
 /** Local-demo only: Hardhat's public test mnemonic. Listener A..D use accounts #1..#4. */
 export const EXECUTOR_MNEMONIC  = optional("EXECUTOR_MNEMONIC", "test test test test test test test test test test test junk");
 export const OWNER_MNEMONIC     = optional("OWNER_MNEMONIC", "test test test test test test test test test test test junk");
+export const SEPOLIA_LISTENER_MNEMONIC = SOURCE_MODE === "sepolia"
+  ? optional("SEPOLIA_LISTENER_MNEMONIC", "")
+  : EXECUTOR_MNEMONIC;
+
+// Settlement timing:
+// c is CONFIRMATIONS (source blocks, dimensionless); lambdaB is the source
+// polling interval (POLL_INTERVAL_MS / 1000 seconds). The default delta A is
+// derived from the existing timeout, polling, confirmations, and grace values.
+export const DELTA_B_SECONDS = optionalPositiveNumber("DELTA_B_SECONDS", TX_TIMEOUT_MS / 1000);
+export const BACKUP_GRACE_SECONDS = optionalPositiveNumber(
+  "BACKUP_GRACE_SECONDS",
+  Math.max(1, Math.ceil(POLL_INTERVAL_MS / 1000)),
+);
+export const DELTA_A_SECONDS = optionalPositiveNumber(
+  "DELTA_A_SECONDS",
+  DELTA_B_SECONDS + CONFIRMATIONS * (POLL_INTERVAL_MS / 1000) + BACKUP_GRACE_SECONDS + 1,
+);
+export const SETTLEMENT_C = CONFIRMATIONS;
+export const SETTLEMENT_LAMBDA_B_SECONDS = POLL_INTERVAL_MS / 1000;
+if (DELTA_A_SECONDS <= DELTA_B_SECONDS + SETTLEMENT_C * SETTLEMENT_LAMBDA_B_SECONDS) {
+  throw new Error(
+    `DELTA_A_SECONDS (${DELTA_A_SECONDS}) must be greater than ` +
+    `DELTA_B_SECONDS (${DELTA_B_SECONDS}) + cλB ` +
+    `(${SETTLEMENT_C} * ${SETTLEMENT_LAMBDA_B_SECONDS}s)`,
+  );
+}
 
 // Fabric (only used when DESTINATION_TYPE=fabric)
 export const FABRIC_CHANNEL     = optional("FABRIC_CHANNEL", "mychannel");
@@ -139,11 +184,15 @@ export function printConfig() {
   console.log("=== Smart Listener Configuration ===");
   console.log(`  Listener ID:        ${LISTENER_ID}`);
   console.log(`  Source RPC:         ${SOURCE_RPC_URL}`);
+  console.log(`  Source mode:        ${SOURCE_MODE}`);
+  if (SOURCE_MODE === "sepolia") console.log(`  Sepolia escrow:     ${SEPOLIA_ESCROW_ADDRESS || "(not set)"}`);
   console.log(`  SenderContract:     ${SENDER_CONTRACT_ADDRESS || "(not set)"}`);
   console.log(`  Destination type:   ${DESTINATION_TYPE}${DESTINATION_TYPE === "evm" ? ` @ ${DEST_RPC_URL}` : ""}`);
   console.log(`  DB:                 ${DATABASE_URL ? "PostgreSQL" : `SQLite (sql.js) @ ${SQLITE_PATH}`}`);
   console.log(`  Required votes:     ${REQUIRED_VOTES}/${TOTAL_LISTENERS}`);
   console.log(`  TX timeout:         ${TX_TIMEOUT_MS}ms`);
+  console.log(`  Settlement windows: ΔB=${DELTA_B_SECONDS}s, ΔA=${DELTA_A_SECONDS}s, backup grace=${BACKUP_GRACE_SECONDS}s`);
+  console.log(`  Settlement bound:   c=${SETTLEMENT_C}, λB=${SETTLEMENT_LAMBDA_B_SECONDS}s`);
   console.log(`  API port:           ${API_PORT}`);
   console.log("=====================================");
 }

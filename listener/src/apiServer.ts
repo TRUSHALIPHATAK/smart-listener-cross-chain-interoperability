@@ -22,7 +22,7 @@ import { ethers } from "ethers";
 import { WebSocketServer, WebSocket } from "ws";
 import { getDb, closeDb } from "./db";
 import { childLogger } from "./logger";
-import { API_PORT, API_HOST, API_CORS_ORIGINS, SOURCE_RPC_URL, EXECUTOR_MNEMONIC } from "./config";
+import { API_PORT, API_HOST, API_CORS_ORIGINS, SOURCE_RPC_URL, EXECUTOR_MNEMONIC, SOURCE_CHAIN_ID, SOURCE_MODE, SEPOLIA_ESCROW_ADDRESS } from "./config";
 import { TxStatus, CrossChainTransaction, TransferMode } from "./types";
 
 // ── SenderContract ABI (minimal — only sendCrossChainTransaction) ──────────────
@@ -61,6 +61,25 @@ app.use(express.json());
 
 const wsClients = new Set<WebSocket>();
 
+class AsyncMutex {
+  private tail = Promise.resolve();
+
+  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    const previous = this.tail;
+    this.tail = previous.then(() => next);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
+const sourceSubmissionMutex = new AsyncMutex();
+
 export function broadcastUpdate(data: unknown) {
   const msg = JSON.stringify({ type: "update", data, ts: Date.now() });
   for (const client of wsClients) {
@@ -96,6 +115,10 @@ export function validateSubmissionBody(body: unknown): string | null {
   const destinationAddress = (body as { destinationAddress?: unknown }).destinationAddress;
   if (mode === "ETH_TRANSFER" && (typeof destinationAddress !== "string" || !ethers.isAddress(destinationAddress))) {
     return "destinationAddress must be a valid EVM address for ETH_TRANSFER";
+  }
+  const nonce = (body as { nonce?: unknown }).nonce;
+  if (nonce !== undefined && (typeof nonce !== "string" || !/^\d+$/.test(nonce))) {
+    return "nonce must be a non-negative integer string";
   }
   return null;
 }
@@ -144,9 +167,9 @@ app.get("/api/transactions/:txId", async (req: Request, res: Response) => {
     res.json({
       ...tx,
       votes,
-      sourceChainId: 31337,
-      sourceNetwork: "local Hardhat",
-      sourceContractAddress: contracts.SenderContract,
+      sourceChainId: SOURCE_CHAIN_ID,
+      sourceNetwork: SOURCE_MODE === "sepolia" ? "Ethereum Sepolia" : "local Hardhat",
+      sourceContractAddress: SOURCE_MODE === "sepolia" ? SEPOLIA_ESCROW_ADDRESS : contracts.SenderContract,
       destinationNetwork: "local Hardhat (31338)",
       destinationReceiverAddress: contracts.DestinationReceiver,
     });
@@ -206,6 +229,7 @@ app.get("/api/metrics", async (_req: Request, res: Response) => {
       rejected,
       avgLatencyMs: Math.round(avgLatency),
       throughputPerMinute: throughput,
+      rolledBack,
       listeners,
       windowSeconds: WINDOW / 1000,
     });
@@ -225,76 +249,87 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
     const validationError = validateSubmissionBody(req.body);
     if (validationError) return res.status(400).json({ error: validationError });
 
-    const {
+    return await sourceSubmissionMutex.runExclusive(async () => {
+      const {
       destinationChainId = "simulated-evm-chain",
       destinationAddress = "0xRecipientAddress",
       payload,
       transferMode = "MESSAGE_ONLY",
       amountEth = "0",
+      nonce: requestedNonce,
     } = req.body as {
       destinationChainId?: string;
       destinationAddress?: string;
       payload: string | Record<string, unknown>;
       transferMode?: TransferMode;
       amountEth?: string;
-    };
-    const payloadText = typeof payload === "string" ? payload : JSON.stringify(payload);
-    const amountWei = transferMode === "ETH_TRANSFER" ? ethers.parseEther(amountEth) : 0n;
+      nonce?: string;
+      };
+      const payloadText = typeof payload === "string" ? payload : JSON.stringify(payload);
+      const amountWei = transferMode === "ETH_TRANSFER" ? ethers.parseEther(amountEth) : 0n;
 
-    const contracts = loadDeploymentContracts();
-    if (!contracts.SenderContract) {
-      return res.status(503).json({
-        error: "SenderContract not deployed. Run `npm run deploy:local` first.",
-      });
-    }
+      const contracts = loadDeploymentContracts();
+      if (!contracts.SenderContract) {
+        return res.status(503).json({
+          error: "SenderContract not deployed. Run `npm run deploy:local` first.",
+        });
+      }
 
-    const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
+      const provider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
     // The server-owned executor wallet is derived from the configured mnemonic.
     // No signing material is accepted from or returned to API clients.
-    const wallet   = ethers.HDNodeWallet.fromPhrase(EXECUTOR_MNEMONIC).connect(provider);
-    const contract = new ethers.Contract(contracts.SenderContract, SENDER_ABI, wallet);
+      const wallet   = ethers.HDNodeWallet.fromPhrase(EXECUTOR_MNEMONIC).connect(provider);
+      const contract = new ethers.Contract(contracts.SenderContract, SENDER_ABI, wallet);
+      const currentNonce = (await contract.getNonce(wallet.address)).toString();
+      if (requestedNonce !== undefined && requestedNonce !== currentNonce) {
+        return res.status(409).json({ error: "Invalid nonce", code: "INVALID_NONCE", expected: currentNonce });
+      }
+      const pending = await (await getDb()).getTransactionBySenderNonce(wallet.address, currentNonce);
+      if (pending && !["EXECUTED", "FAILED", "REJECTED", "TIMED_OUT", "ROLLED_BACK"].includes(pending.status)) {
+        return res.status(409).json({ error: "Pending transaction conflict for sender nonce", code: "PENDING_CONFLICT", txId: pending.txId });
+      }
 
-    const destChainBytes32 = ethers.encodeBytes32String(destinationChainId.slice(0, 31));
-    const destAddressBytes  = transferMode === "ETH_TRANSFER"
-      ? ethers.getBytes(destinationAddress)
-      : ethers.toUtf8Bytes(destinationAddress);
-    const payloadBytes      = ethers.toUtf8Bytes(payloadText);
-    const balance = await provider.getBalance(wallet.address);
-    if (amountWei > balance) {
-      return res.status(400).json({ error: "Requested ETH amount exceeds the server wallet balance." });
-    }
+      const destChainBytes32 = ethers.encodeBytes32String(destinationChainId.slice(0, 31));
+      const destAddressBytes  = transferMode === "ETH_TRANSFER"
+        ? ethers.getBytes(destinationAddress)
+        : ethers.toUtf8Bytes(destinationAddress);
+      const payloadBytes      = ethers.toUtf8Bytes(payloadText);
+      const balance = await provider.getBalance(wallet.address);
+      if (amountWei > balance) {
+        return res.status(400).json({ error: "Requested ETH amount exceeds the server wallet balance." });
+      }
 
-    log.info({ payload: payloadText.slice(0, 50), dest: destinationChainId, transferMode, amountWei: amountWei.toString() }, "Submitting cross-chain tx");
+      log.info({ payload: payloadText.slice(0, 50), dest: destinationChainId, transferMode, amountWei: amountWei.toString() }, "Submitting cross-chain tx");
 
-    const txn = await contract.sendCrossChainTransaction(
-      destChainBytes32,
-      destAddressBytes,
-      payloadBytes,
-      { value: amountWei }
-    );
-    const receipt = await txn.wait();
+      const txn = await contract.sendCrossChainTransaction(
+        destChainBytes32,
+        destAddressBytes,
+        payloadBytes,
+        { value: amountWei }
+      );
+      const receipt = await txn.wait();
 
     // Extract the emitted txId
-    const iface = new ethers.Interface([
-      "event TransactionSent(bytes32 indexed txId, address indexed sender, bytes32 indexed destinationChainId, bytes destinationAddress, bytes payload, uint256 nonce, uint256 timestamp, uint256 amount)",
+      const iface = new ethers.Interface([
+      "event TransactionSent(bytes32 indexed txId, address indexed sender, bytes32 indexed destinationChainId, bytes destinationAddress, bytes payload, uint256 nonce, uint256 timestamp, uint256 amount, uint256 deadline)",
     ]);
-    const parsedLog = receipt?.logs
+      const parsedLog = receipt?.logs
       .map((l: ethers.Log) => { try { return iface.parseLog({ topics: [...l.topics], data: l.data }); } catch { return null; } })
       .find((e: { name?: string } | null) => e?.name === "TransactionSent");
 
-    const txId = parsedLog?.args?.txId ?? null;
+      const txId = parsedLog?.args?.txId ?? null;
 
-    if (!parsedLog || !txId) {
-      return res.status(502).json({
-        error: "Source transaction was mined, but TransactionSent could not be decoded.",
-        transactionHash: receipt?.hash,
-        blockNumber: receipt?.blockNumber,
-      });
-    }
+      if (!parsedLog || !txId) {
+        return res.status(502).json({
+          error: "Source transaction was mined, but TransactionSent could not be decoded.",
+          transactionHash: receipt?.hash,
+          blockNumber: receipt?.blockNumber,
+        });
+      }
 
-    const eventArgs = parsedLog.args;
-    const now = Date.now();
-    const submitted: CrossChainTransaction = {
+      const eventArgs = parsedLog.args;
+      const now = Date.now();
+      const submitted: CrossChainTransaction = {
       txId: String(txId),
       sender: String(eventArgs.sender),
       destinationChainId: String(eventArgs.destinationChainId),
@@ -305,6 +340,7 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
       transferMode,
       requestedAmountWei: amountWei.toString(),
       sourceValueWei: String(eventArgs.amount),
+      deadline: String(eventArgs.deadline),
       nonce: String(eventArgs.nonce),
       sourceTimestamp: Number(eventArgs.timestamp) * 1000,
       sourceBlockNumber: Number(receipt?.blockNumber ?? 0),
@@ -315,12 +351,12 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
       updatedAt: now,
       approveVotes: 0,
       rejectVotes: 0,
-    };
-    await (await getDb()).upsertTransaction(submitted);
+      };
+      await (await getDb()).upsertTransaction(submitted);
 
-    log.info({ txId, hash: receipt?.hash, block: receipt?.blockNumber }, "Cross-chain tx submitted");
+      log.info({ txId, hash: receipt?.hash, block: receipt?.blockNumber }, "Cross-chain tx submitted");
 
-    return res.json({
+      return res.json({
       success: true,
       txId,
       transactionHash: receipt?.hash,
@@ -328,6 +364,7 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
       senderAddress: wallet.address,
       transferMode,
       requestedAmountWei: amountWei.toString(),
+      });
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);

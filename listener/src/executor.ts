@@ -14,8 +14,10 @@ import { DbAdapter } from "./db";
 import { simulatedExecute } from "./destinationAdapter/simulatedAdapter";
 import { fabricExecute } from "./destinationAdapter/fabricAdapter";
 import { evmExecute } from "./destinationAdapter/evmDestinationAdapter";
+import { sepoliaEscrowExecute } from "./sourceAdapter/sepoliaEscrowAdapter";
 import { childLogger } from "./logger";
-import { DESTINATION_TYPE, MAX_RETRIES, RETRY_BACKOFF_MS } from "./config";
+import { DESTINATION_ROUTE_ID, DESTINATION_TYPE, MAX_RETRIES, RETRY_BACKOFF_MS, SOURCE_MODE } from "./config";
+import { ethers } from "ethers";
 
 const log = childLogger("executor");
 
@@ -39,8 +41,21 @@ export async function executeTransaction(
   }
   log.info({ txId: tx.txId, destination: DESTINATION_TYPE }, "Beginning execution");
 
+  if (
+    SOURCE_MODE !== "sepolia" &&
+    DESTINATION_TYPE === "evm" &&
+    tx.destinationChainId !== ethers.encodeBytes32String(DESTINATION_ROUTE_ID.slice(0, 31))
+  ) {
+    await db.transitionStatus(tx.txId, ["EXECUTING"], "FAILED", {
+      errorMessage: `Unsupported destination route: ${tx.destinationChainId}`,
+    });
+    log.error({ txId: tx.txId, destinationChainId: tx.destinationChainId }, "No destination route configured");
+    return;
+  }
+
   // ── Select destination adapter ─────────────────────────────────────────────
   const executeFn =
+    SOURCE_MODE === "sepolia" ? (current: CrossChainTransaction) => sepoliaEscrowExecute(current) :
     DESTINATION_TYPE === "fabric" ? fabricExecute :
     DESTINATION_TYPE === "evm"    ? evmExecute    :
     simulatedExecute;
@@ -65,7 +80,7 @@ export async function executeTransaction(
   }
 
   // ── Update final state ─────────────────────────────────────────────────────
-  if (lastResult.success && DESTINATION_TYPE === "evm") {
+  if (lastResult.success && DESTINATION_TYPE === "evm" && SOURCE_MODE !== "sepolia") {
     // Step 2: the destination tx is mined, but EXECUTED is only set once the
     // DestinationWatcher sees the Receiver's InterChainCompleted event.
     await db.transitionStatus(tx.txId, ["EXECUTING"], "EXECUTING", {

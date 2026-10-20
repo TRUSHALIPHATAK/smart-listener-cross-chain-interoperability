@@ -21,10 +21,15 @@ import { childLogger } from "./logger";
 import { printConfig, DESTINATION_TYPE } from "./config";
 import { DestinationWatcher } from "./destinationWatcher";
 import {
-  LISTENER_ID, REQUIRED_VOTES, TOTAL_LISTENERS, TX_TIMEOUT_MS,
-  POLL_INTERVAL_MS,
+  LISTENER_ID, REQUIRED_VOTES, TOTAL_LISTENERS,
+  POLL_INTERVAL_MS, DELTA_B_SECONDS, BACKUP_GRACE_SECONDS,
 } from "./config";
 import { CrossChainTransaction, TransactionEvent, ListenerVote } from "./types";
+import { rollbackTimedOutTransaction, settlementCutoffMs } from "./settlement";
+import { ethers } from "ethers";
+import { transactionDigest, sepoliaEscrowDigest } from "./digest";
+import { EXECUTOR_MNEMONIC, SEPOLIA_LISTENER_MNEMONIC, SOURCE_CHAIN_ID, DEST_CHAIN_ID, DESTINATION_RECEIVER_ADDRESS, SOURCE_MODE, SEPOLIA_ESCROW_ADDRESS } from "./config";
+import { isLeader } from "./leader";
 
 const log = childLogger("listenerProcess");
 
@@ -68,6 +73,9 @@ function validateTransactionEvent(event: TransactionEvent): { valid: boolean; re
 // ── Main Process ──────────────────────────────────────────────────────────────
 
 async function main() {
+  if (SOURCE_MODE === "sepolia" && !SEPOLIA_LISTENER_MNEMONIC) {
+    throw new Error("SEPOLIA_LISTENER_MNEMONIC must be set for Sepolia listener processes");
+  }
   printConfig();
   log.info({ listenerId: LISTENER_ID }, "Smart Listener starting up");
 
@@ -100,7 +108,7 @@ async function main() {
 
   // Step 2: confirm completion by watching the destination chain's InterChainCompleted event
   let destWatcher: DestinationWatcher | null = null;
-  if (DESTINATION_TYPE === "evm") {
+  if (DESTINATION_TYPE === "evm" && SOURCE_MODE !== "sepolia") {
     destWatcher = new DestinationWatcher(db);
     destWatcher.start();
   }
@@ -112,7 +120,11 @@ async function main() {
     log.info({ txId, blockNumber: event.blockNumber }, "Processing TransactionSent event");
 
     // 1. Validate event
-    const validation = validateTransactionEvent(event);
+    const basicValidation = validateTransactionEvent(event);
+    const authoritativeValidation = basicValidation.valid
+      ? await sourceAdapter.validateAuthoritativeEvent(event)
+      : { valid: false, reason: basicValidation.reason };
+    const validation = authoritativeValidation;
     if (!validation.valid) {
       log.warn({ txId, reason: validation.reason }, "Event validation failed — REJECT vote");
     }
@@ -124,6 +136,7 @@ async function main() {
       destinationChainId:  event.destinationChainId,
       destinationAddress:  event.destinationAddress,
       payload:             event.payload,
+      payloadHash:         event.payloadHash ?? event.payload,
       nonce:               event.nonce.toString(),
       // Contract emits seconds; store milliseconds for consistent UI/API timestamps
       sourceTimestamp:     Number(event.timestamp) * 1000,
@@ -133,11 +146,13 @@ async function main() {
       transferMode:      event.amount > 0n ? "ETH_TRANSFER" : "MESSAGE_ONLY",
       requestedAmountWei: event.amount.toString(),
       sourceValueWei:    event.amount.toString(),
+      deadline:          event.deadline.toString(),
       status:              "PENDING",
       createdAt:           Date.now(),
       updatedAt:           Date.now(),
       approveVotes:        0,
       rejectVotes:         0,
+      escrowContractAddress: event.sourceContractAddress,
     };
     await db.upsertTransaction(tx);
 
@@ -157,17 +172,28 @@ async function main() {
 
     // 5. Cast vote
     const voteValue = validation.valid ? "APPROVE" : "REJECT";
+    const hd = ethers.HDNodeWallet.fromPhrase(
+      SOURCE_MODE === "sepolia" ? SEPOLIA_LISTENER_MNEMONIC : EXECUTOR_MNEMONIC,
+      undefined, `m/44'/60'/0'/0/${["A", "B", "C", "D"].indexOf(LISTENER_ID) + 1}`,
+    );
+    const digest = SOURCE_MODE === "sepolia"
+      ? sepoliaEscrowDigest(tx, SEPOLIA_ESCROW_ADDRESS, SOURCE_CHAIN_ID)
+      : transactionDigest(tx, DESTINATION_RECEIVER_ADDRESS, SOURCE_CHAIN_ID, DEST_CHAIN_ID);
+    const signature = hd.signingKey.sign(digest).serialized;
     const vote: ListenerVote = {
       txId,
       listenerId: LISTENER_ID,
       vote:       voteValue,
       reason:     validation.valid ? undefined : validation.reason,
       votedAt:    Date.now(),
+      signerAddress: hd.address,
+      signature,
+      digest,
     };
 
     // Validate before recording (belt-and-suspenders)
     const existingVotes = await db.getVotes(txId);
-    const voteError = validateVote(txId, LISTENER_ID, voteValue, existingVotes);
+    const voteError = validateVote(txId, LISTENER_ID, voteValue, existingVotes, vote);
     if (voteError) {
       log.warn({ txId, error: voteError }, "Vote validation failed — skipping");
       return;
@@ -189,7 +215,7 @@ async function main() {
       return;
     }
 
-    if (consensus.approved) {
+    if (consensus.approved && isLeader(LISTENER_ID)) {
       // Atomic claim: exactly ONE listener wins the PENDING/VOTED -> APPROVED transition
       // and becomes the execution coordinator. No race, no double execution.
       const won = await db.transitionStatus(txId, ["PENDING", "VOTED"], "APPROVED");
@@ -254,15 +280,53 @@ async function main() {
 
   const sweepTimeouts = async () => {
     try {
-      const timedOut = await db.getTimedOutTransactions(TX_TIMEOUT_MS);
+      // Leadership rotates by wall-clock round. A new leader retries coordination
+      // for transactions whose prior coordinator failed without client control.
+      if (isLeader(LISTENER_ID)) {
+        for (const approved of await db.listTransactions({ status: "APPROVED" })) {
+          await executeTransaction(approved, db);
+        }
+        for (const pending of [
+          ...(await db.listTransactions({ status: "PENDING" })),
+          ...(await db.listTransactions({ status: "VOTED" })),
+        ]) {
+          const votes = await db.getVotes(pending.txId);
+          const consensus = evaluateConsensus(votes, { requiredVotes: REQUIRED_VOTES, totalListeners: TOTAL_LISTENERS });
+          if (consensus.approved && await db.transitionStatus(pending.txId, ["PENDING", "VOTED"], "APPROVED")) {
+            const current = await db.getTransaction(pending.txId);
+            if (current) void executeTransaction(current, db);
+          }
+        }
+      }
+      const timedOut = await db.getTimedOutTransactions(DELTA_B_SECONDS * 1000);
       for (const tx of timedOut) {
+        if (destWatcher && DESTINATION_TYPE === "evm") {
+          const reconciled = await destWatcher.reconcile(tx.txId);
+          if (reconciled === "confirmed") continue;
+        }
         log.warn({ txId: tx.txId, status: tx.status, ageMs: Date.now() - tx.createdAt }, "Transaction timed out");
         await db.transitionStatus(tx.txId, [tx.status], "TIMED_OUT", {
-          errorMessage: `Timed out after ${TX_TIMEOUT_MS}ms in status ${tx.status}`,
+          errorMessage: `Timed out after ${DELTA_B_SECONDS}s in status ${tx.status}`,
         });
       }
-      if (timedOut.length > 0) {
-        log.info({ count: timedOut.length }, "Timeout sweep complete");
+
+      const rollbackCandidates = SOURCE_MODE === "sepolia" ? [] : await db.getRollbackCandidates(
+        settlementCutoffMs() + BACKUP_GRACE_SECONDS * 1000,
+      );
+      for (const tx of rollbackCandidates) {
+        if (destWatcher && DESTINATION_TYPE === "evm") {
+          const reconciled = await destWatcher.reconcile(tx.txId);
+          if (reconciled === "confirmed") continue;
+        }
+        try {
+          const changed = await rollbackTimedOutTransaction(db, tx);
+          if (changed) log.warn({ txId: tx.txId }, "Transaction rolled back after destination reconciliation window");
+        } catch (err) {
+          log.warn({ txId: tx.txId, err }, "Rollback settlement attempt failed");
+        }
+      }
+      if (timedOut.length > 0 || rollbackCandidates.length > 0) {
+        log.info({ timedOut: timedOut.length, rollbackCandidates: rollbackCandidates.length }, "Settlement sweep complete");
       }
     } catch (err) {
       log.warn({ err }, "Timeout sweep error");

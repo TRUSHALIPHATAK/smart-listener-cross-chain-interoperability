@@ -16,6 +16,11 @@ describe("transaction submission validation", () => {
     })).toMatch(/privateKey must not be supplied/);
   });
 
+  it("validates explicit nonces", () => {
+    expect(validateSubmissionBody({ payload: "ok", nonce: "not-a-number" })).toMatch(/nonce/);
+    expect(validateSubmissionBody({ payload: "ok", nonce: "7" })).toBeNull();
+  });
+
   it("rejects missing or blank payloads", () => {
     expect(validateSubmissionBody({ destinationAddress: "0xrecipient" })).toBe("payload is required");
     expect(validateSubmissionBody({ payload: "   " })).toBe("payload is required");

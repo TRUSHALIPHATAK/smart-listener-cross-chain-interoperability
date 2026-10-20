@@ -32,7 +32,8 @@ contract SenderContract {
         bytes   payload,
         uint256 nonce,
         uint256 timestamp,
-        uint256 amount
+        uint256 amount,
+        uint256 deadline
     );
 
     /**
@@ -57,6 +58,9 @@ contract SenderContract {
     mapping(bytes32 => uint256) public txSubmittedAt;
     mapping(bytes32 => bool) public txFinalized;
     mapping(bytes32 => bool) public txRefunded;
+    mapping(bytes32 => bool) public txRolledBack;
+
+    event TransactionRolledBack(bytes32 indexed txId, address indexed sender, uint256 amount);
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
@@ -69,8 +73,10 @@ contract SenderContract {
     error NotFinalizable();
     error RefundTooEarly();
     error TransferFailed();
+    error RollbackTooEarly();
 
     uint256 public constant REFUND_DELAY = 60 seconds;
+    uint256 public constant DEADLINE_WINDOW = 1 hours;
 
     // ── Modifiers ─────────────────────────────────────────────────────────────
 
@@ -134,7 +140,8 @@ contract SenderContract {
             payload,
             nonce,
             block.timestamp,
-            msg.value
+            msg.value,
+            block.timestamp + DEADLINE_WINDOW
         );
     }
 
@@ -179,6 +186,27 @@ contract SenderContract {
             (bool ok, ) = payable(msg.sender).call{value: amount}("");
             if (!ok) revert TransferFailed();
         }
+    }
+
+    /**
+     * @notice Owner-coordinated settlement after the backup window expires.
+     *         This is idempotent once rollback has completed and never touches
+     *         an escrow that was finalized or refunded.
+     */
+    function rollbackTransaction(bytes32 txId) external onlyOwner {
+        if (txRolledBack[txId]) return;
+        address sender = txSenders[txId];
+        if (sender == address(0) || txFinalized[txId] || txRefunded[txId]) revert NotFinalizable();
+        if (block.timestamp < txSubmittedAt[txId] + REFUND_DELAY) revert RollbackTooEarly();
+
+        uint256 amount = txAmounts[txId];
+        txRolledBack[txId] = true;
+        delete txSenders[txId];
+        if (amount > 0) {
+            (bool ok, ) = payable(sender).call{value: amount}("");
+            if (!ok) revert TransferFailed();
+        }
+        emit TransactionRolledBack(txId, sender, amount);
     }
 
     receive() external payable {}

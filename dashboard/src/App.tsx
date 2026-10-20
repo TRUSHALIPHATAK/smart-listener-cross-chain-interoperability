@@ -3,8 +3,9 @@ import { LandingPage } from "./components/LandingPage";
 import { api } from "./api";
 import { TransactionDetail } from "./components/TransactionDetail";
 import type { ListenerHeartbeat, Metrics, Transaction, TxStatus, TransferMode } from "./api";
+import { SepoliaTransfer } from "./components/SepoliaTransfer";
 
-type Page = "landing" | "dashboard" | "submit";
+type Page = "landing" | "dashboard" | "submit" | "sepolia";
 
 const STATUS_LIST: TxStatus[] = [
   "PENDING", "VOTED", "APPROVED", "EXECUTING",
@@ -26,7 +27,7 @@ function normalizeStatus(status: string): TxStatus {
 
 /* ---------- Small inline icons (replace emojis, inherit text colour) ---------- */
 
-type IconName = "overview" | "dashboard" | "send" | "refresh";
+type IconName = "overview" | "dashboard" | "send" | "refresh" | "wallet";
 
 function Icon({ name }: { name: IconName }) {
   const common = {
@@ -71,6 +72,13 @@ function Icon({ name }: { name: IconName }) {
         <svg {...common}>
           <path d="M21 12a9 9 0 1 1-3-6.7" />
           <path d="M21 3v6h-6" />
+        </svg>
+      );
+    case "wallet":
+      return (
+        <svg {...common}>
+          <rect x="3" y="6" width="18" height="14" rx="2" />
+          <path d="M3 9h15a3 3 0 0 1 3 3v4h-5a2 2 0 0 1 0-4h5" />
         </svg>
       );
   }
@@ -283,6 +291,7 @@ export default function App() {
     { page: "landing", label: "Overview", icon: "overview" },
     { page: "dashboard", label: "Dashboard", icon: "dashboard" },
     { page: "submit", label: "Submit transaction", icon: "send" },
+    { page: "sepolia", label: "Sepolia transfer", icon: "wallet" },
   ];
 
   const metricCards: [string, string | number][] = metrics
@@ -294,6 +303,7 @@ export default function App() {
         ["Failed", metrics.failed],
         ["Rejected", metrics.rejected],
         ["Timed out", metrics.timedOut],
+        ["Rolled back", metrics.rolledBack],
         ["Average latency", `${metrics.avgLatencyMs} ms`],
         ["Throughput", `${metrics.throughputPerMinute}/min`],
       ]
@@ -350,6 +360,8 @@ export default function App() {
 
       <main className="main-content">
         {page === "landing" && <LandingPage onNavigate={setPage} />}
+
+        {page === "sepolia" && <SepoliaTransfer />}
 
         {page === "dashboard" && (
           <div className="dashboard-page">
