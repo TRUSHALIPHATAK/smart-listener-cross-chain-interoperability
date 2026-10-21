@@ -8,8 +8,8 @@ import {
   SEPOLIA_CHAIN_HEX,
   SEPOLIA_CHAIN_ID,
   SEPOLIA_ESCROW_ABI,
-  SEPOLIA_ESCROW_ADDRESS,
 } from "../sepolia";
+import { api, SepoliaEscrowStatus } from "../api";
 
 type TransferStatus = "idle" | "awaiting-wallet" | "pending" | "locked" | "completed" | "failed";
 type ApiTransaction = {
@@ -42,7 +42,14 @@ export const SepoliaTransfer: React.FC = () => {
   const [recipientAfterWei, setRecipientAfterWei] = useState<bigint | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [escrow, setEscrow] = useState<SepoliaEscrowStatus | null>(null);
   const provider = getEthereumProvider();
+
+  useEffect(() => {
+    void api.getDeployment()
+      .then((deployment) => setEscrow(deployment.sepolia))
+      .catch((err) => setError(errorMessage(err)));
+  }, []);
 
   const refreshWallet = useCallback(async () => {
     if (!provider) return;
@@ -123,8 +130,8 @@ export const SepoliaTransfer: React.FC = () => {
     try {
       if (!provider || !account) throw new Error("Connect MetaMask before depositing.");
       if (chainId !== SEPOLIA_CHAIN_ID) throw new Error("Switch MetaMask to Sepolia before depositing.");
-      if (!SEPOLIA_ESCROW_ADDRESS || !ethers.isAddress(SEPOLIA_ESCROW_ADDRESS)) {
-        throw new Error("The Sepolia escrow address is not configured in the dashboard.");
+      if (!escrow?.verified || !escrow.escrowAddress || !ethers.isAddress(escrow.escrowAddress)) {
+        throw new Error(escrow?.error ?? "The Sepolia escrow is not configured and verified by the listener API.");
       }
       if (!ethers.isAddress(recipient.trim())) throw new Error("Enter a valid recipient address.");
       const amountWei = ethers.parseEther(amountEth.trim());
@@ -138,15 +145,17 @@ export const SepoliaTransfer: React.FC = () => {
       const payloadHash = ethers.keccak256(ethers.toUtf8Bytes(payload));
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600);
       const nonce = BigInt(Date.now());
-      const escrow = new ethers.Contract(SEPOLIA_ESCROW_ADDRESS, SEPOLIA_ESCROW_ABI, signer);
+      const escrowContract = new ethers.Contract(escrow.escrowAddress, SEPOLIA_ESCROW_ABI, signer);
       const feeData = await browserProvider.getFeeData();
-      const gasLimit = await escrow.deposit.estimateGas(id, recipientAddress, payloadHash, deadline, nonce, { value: amountWei });
+      const runtimeCode = await browserProvider.getCode(escrow.escrowAddress);
+      if (runtimeCode === "0x") throw new Error("The configured Sepolia escrow address has no contract bytecode on the connected chain.");
+      const gasLimit = await escrowContract.deposit.estimateGas(id, recipientAddress, payloadHash, deadline, nonce, { value: amountWei });
       const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
       const senderBalance = await browserProvider.getBalance(account);
       if (senderBalance < amountWei + gasLimit * gasPrice) throw new Error("The connected wallet does not have enough ETH for the deposit plus estimated gas.");
       setStatus("awaiting-wallet");
       setNotice("Review and approve the escrow deposit in MetaMask. ETH will remain locked until listener consensus.");
-      const tx = await escrow.deposit(id, recipientAddress, payloadHash, deadline, nonce, { value: amountWei });
+      const tx = await escrowContract.deposit(id, recipientAddress, payloadHash, deadline, nonce, { value: amountWei });
       setStatus("pending"); setTxId(id); setDepositHash(tx.hash);
       setNotice(`Deposit submitted. Waiting for confirmation: ${tx.hash}`);
       const receipt = await tx.wait();
@@ -192,7 +201,7 @@ export const SepoliaTransfer: React.FC = () => {
         <div><span>Deposit transaction</span><a href={explorerTransactionUrl(depositHash)} target="_blank" rel="noreferrer" className="mono-cell">{depositHash}</a></div>
         {record?.destTxHash && <div><span>Release transaction</span><a href={explorerTransactionUrl(record.destTxHash)} target="_blank" rel="noreferrer" className="mono-cell">{record.destTxHash}</a></div>}
         <div><span>Consensus</span><strong>{record ? `${record.approveVotes}/3 approvals, ${record.rejectVotes} rejections` : "Waiting for listeners"}</strong></div>
-        <div><span>Escrow contract</span><a href={explorerAddressUrl(SEPOLIA_ESCROW_ADDRESS)} target="_blank" rel="noreferrer" className="mono-cell">{SEPOLIA_ESCROW_ADDRESS}</a></div>
+        {escrow?.escrowAddress && <div><span>Escrow contract</span><a href={explorerAddressUrl(escrow.escrowAddress)} target="_blank" rel="noreferrer" className="mono-cell">{escrow.escrowAddress}</a></div>}
         {record?.votes?.map((vote) => <div key={vote.listenerId}><span>Listener {vote.listenerId}</span><strong>{vote.vote}{vote.reason ? ` — ${vote.reason}` : ""}</strong></div>)}
         {recipientBeforeWei !== null && <div><span>Recipient balance before</span><strong>{formatBalance(recipientBeforeWei)} ETH</strong></div>}
         {recipientAfterWei !== null && <div><span>Recipient balance after</span><strong>{formatBalance(recipientAfterWei)} ETH</strong></div>}

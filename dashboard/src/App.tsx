@@ -2,10 +2,13 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { LandingPage } from "./components/LandingPage";
 import { api } from "./api";
 import { TransactionDetail } from "./components/TransactionDetail";
-import type { ListenerHeartbeat, Metrics, Transaction, TxStatus, TransferMode } from "./api";
+import type { ListenerHeartbeat, Metrics, Transaction, TxStatus } from "./api";
 import { SepoliaTransfer } from "./components/SepoliaTransfer";
+import { ethers } from "ethers";
+import { BlockchainExplorer } from "./components/BlockchainExplorer";
+import type { ExplorerSnapshot } from "./api";
 
-type Page = "landing" | "dashboard" | "submit" | "sepolia";
+type Page = "landing" | "dashboard" | "submit" | "sepolia" | "explorer";
 
 const STATUS_LIST: TxStatus[] = [
   "PENDING", "VOTED", "APPROVED", "EXECUTING",
@@ -158,13 +161,47 @@ export default function App() {
   const [destinationAddress, setDestinationAddress] = useState(
     "0xRecipientAddressOnDest"
   );
+  const [senderAddress, setSenderAddress] = useState("");
   const [payload, setPayload] = useState("Hello from Smart Listener");
-  const [transferMode, setTransferMode] = useState<TransferMode>("MESSAGE_ONLY");
   const [amountEth, setAmountEth] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submittedHash, setSubmittedHash] = useState("");
+  const [highlightedTransactionId, setHighlightedTransactionId] = useState("");
   const [selectedTransaction, setSelectedTransaction] = useState<Transaction | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [explorer, setExplorer] = useState<ExplorerSnapshot | null>(null);
+  const [walletAddress, setWalletAddress] = useState("");
+  const [walletBalance, setWalletBalance] = useState("");
+
+  async function connectLocalWallet() {
+    if (!window.ethereum) throw new Error("MetaMask or another browser wallet is required.");
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    let network = await provider.getNetwork();
+    if (network.chainId !== 31337n) {
+      try {
+        await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x7a69" }] });
+      } catch (error) {
+        const code = (error as { code?: number }).code;
+        if (code !== 4902) throw error;
+        await window.ethereum.request({
+          method: "wallet_addEthereumChain",
+          params: [{
+            chainId: "0x7a69",
+            chainName: "Smart Listener Local Hardhat",
+            nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+            rpcUrls: ["http://127.0.0.1:8545"],
+          }],
+        });
+      }
+      network = await provider.getNetwork();
+    }
+    if (network.chainId !== 31337n) throw new Error("Wallet must be connected to local Hardhat (chain ID 31337).");
+    const signer = await provider.getSigner();
+    const address = await signer.getAddress();
+    setWalletAddress(address);
+    if (!senderAddress) setSenderAddress(address);
+    setWalletBalance(ethers.formatEther(await provider.getBalance(address)));
+  }
 
   const loadDashboard = useCallback(async () => {
     setLoading(true);
@@ -195,6 +232,21 @@ export default function App() {
     }
   }, []);
 
+  const loadExplorer = useCallback(async () => {
+    try {
+      const [snapshot, txResult] = await Promise.all([
+        api.getExplorer(),
+        api.getTransactions({ limit: 200 }),
+      ]);
+      setExplorer(snapshot);
+      setTransactions(txResult.transactions);
+      setListeners(snapshot.listeners);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load explorer state.");
+    }
+  }, []);
+
   const connectWs = useCallback(() => {
     setWsStatus("connecting");
 
@@ -213,15 +265,19 @@ export default function App() {
   useEffect(() => {
     const ws = connectWs();
     void loadDashboard();
+    void loadExplorer();
 
-    const refresh = window.setInterval(() => void loadDashboard(), 5000);
+    const refresh = window.setInterval(() => {
+      void loadDashboard();
+      void loadExplorer();
+    }, 5000);
 
     return () => {
       window.clearInterval(refresh);
       ws.close();
       wsRef.current = null;
     };
-  }, [connectWs, loadDashboard]);
+  }, [connectWs, loadDashboard, loadExplorer]);
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -231,31 +287,83 @@ export default function App() {
     setSubmittedHash("");
 
     try {
-      if (!destinationAddress.trim()) throw new Error("Destination recipient is required.");
-      if (transferMode === "ETH_TRANSFER") {
-        if (!/^0x[0-9a-fA-F]{40}$/.test(destinationAddress.trim())) {
-          throw new Error("ETH transfers require a valid destination EVM address.");
-        }
-        if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(amountEth.trim()) || Number(amountEth) <= 0) {
-          throw new Error("Enter a positive ETH amount, for example 0.01.");
-        }
+      const sender = senderAddress.trim();
+      const recipient = destinationAddress.trim();
+      if (!ethers.isAddress(sender)) throw new Error("Enter a valid sender Ethereum address.");
+      if (!ethers.isAddress(recipient)) throw new Error("Enter a valid recipient Ethereum address.");
+      if (!payload.trim()) throw new Error("Payload is required.");
+      let value = 0n;
+      try {
+        value = ethers.parseEther(amountEth.trim());
+      } catch {
+        throw new Error("Enter a valid ETH amount, for example 0.01.");
       }
-      const result = await api.submitTransaction({
-        destinationAddress,
-        payload,
-        transferMode,
-        amountEth: transferMode === "ETH_TRANSFER" ? amountEth : "0",
-      });
+      if (value <= 0n) throw new Error("ETH amount must be greater than zero.");
+      if (!window.ethereum) throw new Error("Connect the sender's local Hardhat wallet before submitting.");
 
-      const hash = result.transactionHash ?? result.txHash ?? result.hash ?? "";
-      setSubmittedHash(hash);
-      setNotice(
-        hash
-          ? "Transaction submitted to the source chain. Listener processing may still be in progress."
-          : "The API accepted the request. Check the response and dashboard for transaction details."
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const network = await provider.getNetwork();
+      if (network.chainId !== 31337n) {
+        throw new Error("MetaMask must be connected to Local Hardhat chain ID 31337.");
+      }
+      const signer = await provider.getSigner();
+      const connectedAddress = await signer.getAddress();
+      if (connectedAddress.toLowerCase() !== sender.toLowerCase()) {
+        throw new Error(`Connected wallet ${connectedAddress} does not match the sender address.`);
+      }
+
+      const balance = await provider.getBalance(sender);
+      const deployment = await api.getDeployment();
+      const contractAddress = deployment.contracts.SenderContract;
+      if (!contractAddress) throw new Error("SenderContract is not deployed. Run npm run dev first.");
+      const senderContract = new ethers.Contract(contractAddress, [
+        "function sendCrossChainTransaction(bytes32,bytes,bytes) payable returns (bytes32)",
+      ], signer);
+      const destinationBytes = ethers.getBytes(recipient);
+      const gasLimit = await senderContract.sendCrossChainTransaction.estimateGas(
+        ethers.encodeBytes32String("simulated-evm-chain"),
+        destinationBytes,
+        ethers.toUtf8Bytes(payload),
+        { value },
       );
+      const feeData = await provider.getFeeData();
+      const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 0n;
+      const estimatedFee = gasLimit * gasPrice;
+      if (balance < value + estimatedFee) {
+        throw new Error("Sender balance is insufficient for the ETH amount plus estimated gas.");
+      }
+
+      const tx = await senderContract.sendCrossChainTransaction(
+        ethers.encodeBytes32String("simulated-evm-chain"),
+        destinationBytes,
+        ethers.toUtf8Bytes(payload),
+        { value },
+      );
+      const receipt = await tx.wait();
+      if (!receipt || receipt.status !== 1) throw new Error("The source transaction failed.");
+      const sourceHash = receipt.hash ?? tx.hash;
+      const eventInterface = new ethers.Interface([
+        "event TransactionSent(bytes32 indexed txId,address indexed sender,bytes32 indexed destinationChainId,bytes destinationAddress,bytes payload,uint256 nonce,uint256 timestamp,uint256 amount,uint256 deadline)",
+      ]);
+      const event = receipt.logs
+        .map((log: ethers.Log): ethers.LogDescription | null => {
+          try {
+            return eventInterface.parseLog({ topics: [...log.topics], data: log.data });
+          } catch {
+            return null;
+          }
+        })
+        .find((parsed: ethers.LogDescription | null) => parsed?.name === "TransactionSent");
+      const txId = event?.args?.txId;
+      if (!txId) throw new Error("Source transaction succeeded, but its protocol event could not be decoded.");
+
+      setWalletBalance(ethers.formatEther(await provider.getBalance(sender)));
+      setSubmittedHash(sourceHash);
+      setHighlightedTransactionId(String(txId));
+      setNotice("Source transaction mined. Listeners are independently validating it before destination execution.");
       await loadDashboard();
-      setPage("dashboard");
+      await loadExplorer();
+      setPage("explorer");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not submit the transaction.");
     } finally {
@@ -290,6 +398,7 @@ export default function App() {
   const navItems: { page: Page; label: string; icon: IconName }[] = [
     { page: "landing", label: "Overview", icon: "overview" },
     { page: "dashboard", label: "Dashboard", icon: "dashboard" },
+    { page: "explorer", label: "Explorer / Accounts", icon: "wallet" },
     { page: "submit", label: "Submit transaction", icon: "send" },
     { page: "sepolia", label: "Sepolia transfer", icon: "wallet" },
   ];
@@ -342,6 +451,7 @@ export default function App() {
                 setError("");
                 setNotice("");
                 if (target === "dashboard") void loadDashboard();
+                if (target === "explorer") void loadExplorer();
               }}
             >
               <Icon name={icon} />
@@ -362,6 +472,16 @@ export default function App() {
         {page === "landing" && <LandingPage onNavigate={setPage} />}
 
         {page === "sepolia" && <SepoliaTransfer />}
+
+        {page === "explorer" && (
+          <BlockchainExplorer
+            snapshot={explorer}
+            transactions={transactions}
+            highlightedTransactionId={highlightedTransactionId}
+            onRefresh={loadExplorer}
+            onOpenTransaction={openTransaction}
+          />
+        )}
 
         {page === "dashboard" && (
           <div className="dashboard-page">
@@ -518,7 +638,24 @@ export default function App() {
               <Panel title="Transaction details">
                 <form onSubmit={handleSubmit} className="transaction-form">
                   <div className="form-group">
-                    <label htmlFor="destination">Destination address</label>
+                    <label htmlFor="sender-address">Sender address</label>
+                    <input
+                      id="sender-address"
+                      value={senderAddress}
+                      onChange={(event) => setSenderAddress(event.target.value)}
+                      required
+                      placeholder="0x…"
+                    />
+                    <p className="form-hint">
+                      This address must match the account connected in MetaMask. The backend will never substitute its own account.
+                    </p>
+                    <button className="btn-secondary" type="button" onClick={() => void connectLocalWallet()}>
+                      <Icon name="wallet" />
+                      {walletAddress ? `${walletAddress.slice(0, 10)}… (${walletBalance} ETH)` : "Connect local MetaMask account"}
+                    </button>
+                  </div>
+                  <div className="form-group">
+                    <label htmlFor="destination">Recipient address</label>
                     <input
                       id="destination"
                       value={destinationAddress}
@@ -530,36 +667,18 @@ export default function App() {
                   </div>
 
                   <div className="form-group">
-                    <label htmlFor="transfer-mode">Transfer mode</label>
-                    <select
-                      id="transfer-mode"
-                      value={transferMode}
-                      onChange={(event) => {
-                        const mode = event.target.value as TransferMode;
-                        setTransferMode(mode);
-                        if (mode === "MESSAGE_ONLY") setAmountEth("");
-                      }}
-                    >
-                      <option value="MESSAGE_ONLY">Message-only — no ETH transfer</option>
-                      <option value="ETH_TRANSFER">ETH transfer with payload</option>
-                    </select>
+                    <label htmlFor="amount-eth">ETH amount</label>
+                    <input
+                      id="amount-eth"
+                      type="text"
+                      inputMode="decimal"
+                      value={amountEth}
+                      onChange={(event) => setAmountEth(event.target.value)}
+                      required
+                      placeholder="0.01"
+                    />
+                    <p className="form-hint">The sender must have enough ETH for the transfer and source-chain gas.</p>
                   </div>
-
-                  {transferMode === "ETH_TRANSFER" && (
-                    <div className="form-group">
-                      <label htmlFor="amount-eth">ETH amount</label>
-                      <input
-                        id="amount-eth"
-                        type="text"
-                        inputMode="decimal"
-                        value={amountEth}
-                        onChange={(event) => setAmountEth(event.target.value)}
-                        required
-                        placeholder="0.01"
-                      />
-                      <p className="form-hint">Exact positive ETH amount. The backend validates and converts it to wei.</p>
-                    </div>
-                  )}
 
                   <div className="form-group">
                     <label htmlFor="payload">Payload</label>
@@ -630,7 +749,7 @@ export default function App() {
           Smart Listener · Bigiotti et al. (2025) · Majority-vote variant of the Smart Listeners protocol
         </span>
         <span className="footer-note">
-          Simulated destination · No cross-chain atomicity guarantee
+          Local EVM destination · No cross-chain atomicity guarantee
         </span>
       </footer>
     </div>

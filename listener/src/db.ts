@@ -192,7 +192,7 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function acquireLock(lockPath: string, timeoutMs = 5000): Promise<() => void> {
+async function acquireLock(lockPath: string, timeoutMs = 30_000): Promise<() => void> {
   const start = Date.now();
   let delay = 5;
   while (true) {
@@ -205,7 +205,9 @@ async function acquireLock(lockPath: string, timeoutMs = 5000): Promise<() => vo
       };
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException).code;
-      if (code !== "EEXIST") throw err;
+      // Windows can report EPERM/EACCES while another process is creating or
+      // holding the lock file. Treat those codes as contention for this lock.
+      if (code !== "EEXIST" && code !== "EPERM" && code !== "EACCES") throw err;
       // Stale lock recovery: if older than 10s, remove it
       try {
         const stat = fs.statSync(lockPath);

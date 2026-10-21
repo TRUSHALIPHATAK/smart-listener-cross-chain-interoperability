@@ -89,6 +89,64 @@ export interface SubmitTransactionResponse {
   transferMode?: TransferMode;
   requestedAmountWei?: string;
 }
+export interface DeploymentInfo {
+  deployed: boolean;
+  contracts: Record<string, string>;
+  rpcUrl: string;
+  sourceChainId?: number;
+  sourceNetwork?: string;
+  destinationChainId?: number;
+  destinationNetwork?: string;
+  sepolia: SepoliaEscrowStatus;
+}
+
+export interface SepoliaEscrowStatus {
+  chainId: number;
+  configured: boolean;
+  verified: boolean;
+  escrowAddress: string | null;
+  error?: string;
+}
+
+export interface ExplorerAccount {
+  index: number;
+  address: string;
+  balanceWei: string;
+  balanceEth: string;
+  transactionCount: number;
+  localTestAccount: boolean;
+}
+
+export interface ExplorerNetwork {
+  name: string;
+  chainId: number | null;
+  expectedChainId: number | null;
+  rpcUrl: string | null;
+  connected: boolean;
+  nativeCurrency: string;
+  latestBlock: number | null;
+  accounts: ExplorerAccount[];
+  contracts: Array<{ contract: string; address: string; deployed: boolean }>;
+  error?: string;
+}
+
+export interface ExplorerSnapshot {
+  source: ExplorerNetwork;
+  destination: ExplorerNetwork;
+  totalTrackedTransactions: number;
+  listeners: ListenerHeartbeat[];
+  requiredVotes: number;
+  totalListeners: number;
+  sourceMode: string;
+  destinationType: string;
+  sepolia: {
+    chainId: number;
+    configured: boolean;
+    verified: boolean;
+    escrowAddress: string | null;
+    error?: string;
+  };
+}
 
 const API_BASE = "/api";
 
@@ -116,6 +174,10 @@ export const api = {
     apiFetch<{ listeners: ListenerHeartbeat[] }>(`/listeners`),
   getMetrics: () =>
     apiFetch<Metrics>(`/metrics`),
+  getDeployment: () =>
+    apiFetch<DeploymentInfo>(`/deployment`),
+  getExplorer: () =>
+    apiFetch<ExplorerSnapshot>(`/explorer`),
   submitTransaction: async (request: SubmitTransactionRequest): Promise<SubmitTransactionResponse> => {
     const res = await fetch(`${API_BASE}/transactions/submit`, {
       method: "POST",

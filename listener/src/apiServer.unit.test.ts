@@ -1,4 +1,8 @@
-import { isApiOriginAllowed, validateSubmissionBody } from "./apiServer";
+import {
+  isApiOriginAllowed,
+  validateSepoliaEscrowMetadata,
+  validateSubmissionBody,
+} from "./apiServer";
 
 describe("transaction submission validation", () => {
   it("accepts a valid client submission without signing material", () => {
@@ -6,6 +10,26 @@ describe("transaction submission validation", () => {
       destinationAddress: "0xrecipient",
       payload: "hello",
     })).toBeNull();
+  });
+
+  describe("Sepolia escrow configuration validation", () => {
+    const address = "0x1111111111111111111111111111111111111111";
+
+    it("rejects a missing/invalid escrow address", () => {
+      expect(validateSepoliaEscrowMetadata("", 11155111, "0x1234", 3n, 4n)).toMatch(/valid EVM address/);
+    });
+
+    it("rejects an address checked against the wrong chain", () => {
+      expect(validateSepoliaEscrowMetadata(address, 31337, "0x1234", 3n, 4n)).toMatch(/expected 11155111/);
+    });
+
+    it("rejects an address without deployed bytecode", () => {
+      expect(validateSepoliaEscrowMetadata(address, 11155111, "0x", 3n, 4n)).toMatch(/No contract bytecode/);
+    });
+
+    it("accepts a deployed 3-of-4 escrow", () => {
+      expect(validateSepoliaEscrowMetadata(address, 11155111, "0x6000", 3n, 4n)).toBeNull();
+    });
   });
 
   it("rejects client-supplied private keys", () => {

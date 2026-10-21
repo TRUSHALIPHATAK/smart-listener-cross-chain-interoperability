@@ -136,7 +136,7 @@ async function main() {
       destinationChainId:  event.destinationChainId,
       destinationAddress:  event.destinationAddress,
       payload:             event.payload,
-      payloadHash:         event.payloadHash ?? event.payload,
+      payloadHash:         event.payloadHash ?? ethers.keccak256(event.payload),
       nonce:               event.nonce.toString(),
       // Contract emits seconds; store milliseconds for consistent UI/API timestamps
       sourceTimestamp:     Number(event.timestamp) * 1000,

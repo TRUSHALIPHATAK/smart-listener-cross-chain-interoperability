@@ -200,6 +200,7 @@ function Wait-Listeners([string]$Url, [string[]]$ExpectedIds, [int]$TimeoutSec, 
                 if (([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$listener.lastSeenAt) -lt 30000) {
                     $recent[$listener.listenerId] = $listener
                 }
+
             }
             $missing = @($ExpectedIds | Where-Object { -not $recent.ContainsKey($_) })
             if ($missing.Count -eq 0) {
@@ -217,6 +218,16 @@ function Wait-Listeners([string]$Url, [string[]]$ExpectedIds, [int]$TimeoutSec, 
         Start-Sleep -Milliseconds 500
     }
     throw "Listeners did not register within $TimeoutSec seconds. Last error: $lastError"
+}
+
+function Get-RpcAccounts([string]$Url) {
+    $body = '{"jsonrpc":"2.0","id":1,"method":"eth_accounts","params":[]}'
+    try {
+        $response = Invoke-RestMethod -Uri $Url -Method Post -ContentType "application/json" -Body $body -TimeoutSec 3
+        return @($response.result)
+    } catch {
+        return @()
+    }
 }
 
 function Get-DescendantProcessIds([int]$RootPid) {
@@ -239,8 +250,8 @@ function Get-DescendantProcessIds([int]$RootPid) {
 function Stop-ProcessTree([int]$RootPid) {
     $descendants = @(Get-DescendantProcessIds $RootPid)
     [array]::Reverse($descendants)
-    foreach ($pid in $descendants) {
-        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+    foreach ($childPid in $descendants) {
+        Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
     }
     Stop-Process -Id $RootPid -Force -ErrorAction SilentlyContinue
 }
@@ -320,6 +331,7 @@ try {
         $listenerJobs += Start-LoggedProcess ("listener-" + $id) $listenerDir $tsNode @("src\listenerProcess.ts") @{ LISTENER_ID = $id }
     }
     Wait-Listeners "http://127.0.0.1:3001/api/listeners" @("A", "B", "C", "D") 90 $listenerJobs
+    Wait-HttpOk "http://127.0.0.1:3001/api/ready" 30 "Listener/API readiness" $apiJob
 
     $dashboardDir = Join-Path $Root "dashboard"
     $dashboardJob = Start-LoggedProcess "dashboard" $dashboardDir $vite @("--host", "127.0.0.1", "--port", "5173")
@@ -334,6 +346,16 @@ try {
     Write-Host "Listeners:   http://127.0.0.1:3001/api/listeners"
     Write-Host "Source RPC:  http://127.0.0.1:8545"
     if ($destinationType -eq "evm") { Write-Host "Dest RPC:    http://127.0.0.1:8546" }
+    $requiredVotes = Get-EnvFileValue "REQUIRED_VOTES" "3"
+    $totalListeners = Get-EnvFileValue "TOTAL_LISTENERS" "4"
+    Write-Host "Consensus:   $requiredVotes-of-$totalListeners"
+    Write-Host "Contracts:    Sender=$($deployment.contracts.SenderContract)"
+    if ($deployment.contracts.DestinationReceiver) { Write-Host "              DestinationReceiver=$($deployment.contracts.DestinationReceiver)" }
+    $accounts = @(Get-RpcAccounts "http://127.0.0.1:8545")
+    if ($accounts.Count -gt 0) {
+        Write-Host "Local accounts (development only):"
+        foreach ($account in $accounts | Select-Object -First 5) { Write-Host "  $account" }
+    }
     Write-Host "Logs:        $Root\logs"
     Write-Host ""
     Write-Host "Send a test tx in another window: npm run demo:send"

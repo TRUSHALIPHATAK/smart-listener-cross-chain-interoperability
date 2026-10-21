@@ -150,12 +150,12 @@ const steps: { icon: IconName; title: string; body: string }[] = [
   {
     icon: "vote",
     title: "Majority Consensus (3-of-4)",
-    body: "Votes are tallied in a shared database. When 3 of the 4 listeners approve, consensus is reached and the transaction is marked APPROVED. If 2 listeners reject (making 3 approvals impossible), it becomes REJECTED. No cryptography — these are independent votes.",
+    body: "Votes are tallied for coordination, but the destination contract verifies the listeners' distinct signatures. When 3 of the 4 listeners approve, the signed request can cross the execution boundary.",
   },
   {
     icon: "bolt",
     title: "Destination Execution",
-    body: "The listener that cast the deciding vote acts as coordinator and triggers execution on the destination adapter (currently simulated; Hyperledger Fabric is a modular drop-in). Retries with exponential backoff handle transient failures.",
+    body: "The elected listener coordinator submits the signed request to the local EVM DestinationReceiver, which releases reserve-backed ETH only after on-chain signature verification. Hyperledger Fabric remains a modular adapter path.",
   },
   {
     icon: "shield",
@@ -183,7 +183,7 @@ const architecture: { icon: IconName; title: string; sub: string }[] = [
 const stateFlow = [
   { s: "PENDING", note: "Event seen, awaiting votes" },
   { s: "VOTED", note: "At least 1 vote cast" },
-  { s: "APPROVED", note: "2+ approvals received" },
+  { s: "APPROVED", note: "3-of-4 approvals received" },
   { s: "EXECUTING", note: "Coordinator submitting" },
   { s: "EXECUTED", note: "Destination confirmed" },
 ];

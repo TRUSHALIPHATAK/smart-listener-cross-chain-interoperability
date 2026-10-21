@@ -2,7 +2,7 @@
 
 A modular prototype of the **Smart Listeners** hybrid-optimistic inter-blockchain communication protocol (inspired by Bigiotti et al., 2025).
 
-Four independent off-chain listeners watch a source-chain contract, cast separate approval/rejection votes, and forward a request only when **at least 3 of 4** (a strict majority) approve. The first working demo uses a **local Hardhat** network and a clearly labelled **[SIMULATED]** destination adapter. A Hyperledger Fabric adapter stub is included for later integration.
+Four independent off-chain listeners watch a source-chain escrow contract, independently validate the authoritative event, sign the canonical transaction digest, and forward a request only when **3 of 4** (a strict majority) approve. The default local demo uses two isolated Hardhat chains: source RPC `8545` and destination RPC `8546`. The destination `DestinationReceiver` contract verifies distinct authorized listener signatures before releasing reserve-backed ETH. A Hyperledger Fabric adapter stub is preserved for later integration.
 
 > This system does **not** claim cross-chain atomicity or guaranteed rollback. Listener approvals are independent votes, not threshold cryptography.
 
@@ -15,7 +15,7 @@ Four independent off-chain listeners watch a source-chain contract, cast separat
 | `SenderContract.sol` / `ReceiverMock.sol` | Implemented + Hardhat tests |
 | Majority (3-of-4) consensus module | Implemented + Jest unit tests |
 | EVM source adapter (ethers.js) | Implemented |
-| Simulated destination adapter | Implemented |
+| EVM destination adapter + signature-gated ETH release | Implemented |
 | Fabric destination adapter | Stub only (`DESTINATION_TYPE=fabric`) |
 | Express API + WebSocket push path | Implemented |
 | Persistent storage (sql.js SQLite) | Implemented (no Visual Studio / native build) |
@@ -46,13 +46,14 @@ npm install
 
 This starts:
 
-1. Hardhat local node (`http://127.0.0.1:8545`)
-2. Contract deployment → `deployments/localhost.json` and `listener/config/deployment.json`
-3. API server (`http://127.0.0.1:3001`)
-4. Listeners A, B, and C
-5. Dashboard (`http://127.0.0.1:5173`)
+1. Source Hardhat node (`http://127.0.0.1:8545`, chain ID `31337`)
+2. Destination Hardhat node (`http://127.0.0.1:8546`, chain ID `31338`)
+3. Contract deployment → `deployments/localhost.json` and `listener/config/deployment.json`
+4. API server (`http://127.0.0.1:3001`)
+5. Listeners A, B, C, and D with a 3-of-4 quorum
+6. Dashboard (`http://127.0.0.1:5173`)
 
-Service logs are written under `logs\`. Press **Ctrl+C** in the launcher window to stop everything.
+The launcher waits for RPC, deployment, API, listener, and dashboard readiness and prints contract addresses plus public local test accounts. Service logs are written under `logs\`. Press **Ctrl+C** in the launcher window to stop only the processes it started.
 
 ### Send a test request
 
@@ -63,7 +64,17 @@ cd E:\blockchain\smartlistener
 npm run demo:send
 ```
 
-Then open the dashboard → **Monitor requests** to see votes and `[SIMULATED]` execution. Use **Submit a test request** for explanations only — the UI does not broadcast transactions itself.
+Then open the dashboard → **Dashboard** to see the four votes and destination confirmation. The **Submit transaction** page can use a connected MetaMask local account (directly calling `SenderContract`) or the local API test account. A source submission is not success: the dashboard remains pending until listener signatures are accepted by the destination contract and the destination receipt is confirmed.
+
+### Diagnostics and real-stack smoke test
+
+```powershell
+npm run doctor
+# With npm run dev running:
+npm run test:e2e
+```
+
+`doctor` reports PASS/WARN/FAIL checks for dependencies, consensus configuration, ports, RPC chain IDs, deployment bytecode, API/readiness, and dashboard build output. `test:e2e` submits through the real API and waits for the actual listener and destination-contract lifecycle.
 
 ### External / app-submitted requests
 
@@ -110,7 +121,18 @@ Important variables:
 | `DATABASE_URL` | *(unset)* | If set → PostgreSQL; else sql.js SQLite |
 | `SIMULATED_FAILURE_RATE` | `0.05` | Simulated dest failure probability |
 
-Never hardcode private keys. Hardhat’s well-known local accounts are for local demo only.
+Never use the local Hardhat mnemonic or private keys on Sepolia/Mainnet. Outside `SOURCE_MODE=hardhat` with chain ID `31337`, listener and owner mnemonics must be supplied explicitly.
+
+### Local development accounts and MetaMask
+
+The two local nodes use Hardhat's deterministic development accounts. They are fake, public, and isolated to the local nodes. The launcher prints the first five public addresses; private keys are intentionally not printed. Hardhat account #0 is the local deployer/API sender and listener executor accounts are derived from indexes #1–#4. To connect MetaMask, add network `Smart Listener Local Hardhat`, RPC `http://127.0.0.1:8545`, chain ID `31337`, currency `ETH`, then import only a development account into a local-only wallet profile. Never import these keys into a wallet used for public networks.
+
+Balances can be inspected with:
+
+```powershell
+npx hardhat console --network localhost
+> (await ethers.provider.getBalance("0x...")).toString()
+```
 
 ---
 
@@ -119,6 +141,7 @@ Never hardcode private keys. Hardhat’s well-known local accounts are for local
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/health` | Liveness |
+| GET | `/api/ready` | Real RPC/database/deployment/listener readiness |
 | GET | `/api/transactions` | List (`?status=&limit=&offset=`) |
 | GET | `/api/transactions/:txId` | Detail + votes |
 | GET | `/api/listeners` | Heartbeats + online flag |
@@ -132,15 +155,24 @@ Dashboard Vite proxy forwards `/api` and `/ws` to port 3001.
 ## Tests
 
 ```powershell
+# Full local checks
+npm test
+
 # Solidity / Hardhat
 npm run test:contracts
 
-# Consensus unit tests
-cd listener; npm test
+# Listener unit tests
+npm run test:listener
 
-# TypeScript builds
-cd listener; npm run build
-cd ..\dashboard; npm run build
+# End-to-end smoke test (requires npm run dev in another terminal)
+npm run test:e2e
+
+# TypeScript/dashboard builds
+npm --workspace listener run build
+npm --workspace dashboard run build
+
+# Diagnostics
+npm run doctor
 ```
 
 Previously confirmed baselines (re-run after changes): Hardhat contract tests, Jest consensus tests, listener `tsc`, dashboard production build.
@@ -162,11 +194,11 @@ start-all.ps1        One-command local launcher
 
 ## Transaction flow
 
-1. Caller submits via `SenderContract` → `TransactionSent` event  
-2. Each of four listeners validates independently and votes  
-3. At ≥3 APPROVE → status `APPROVED` → deciding voter runs executor  
-4. `[SIMULATED]` destination adapter returns a fake dest hash (or failure)  
-5. Dashboard shows status, votes, errors, and timing from the API  
+1. Caller submits value into `SenderContract` → `TransactionSent` event
+2. Each of four listeners independently re-reads authoritative source state, signs the canonical digest, and records a vote
+3. At 3 distinct approvals, one listener claims coordination
+4. `DestinationReceiver` verifies the digest, authorized signers, threshold, deadline, and replay state on chain before releasing ETH or recording the message
+5. Destination confirmation is observed before the dashboard reports `EXECUTED`; source settlement remains a separate transaction
 
 ---
 
@@ -174,7 +206,8 @@ start-all.ps1        One-command local launcher
 
 - Destination Fabric path is a **stub** until a Fabric network and gateway SDK are wired.
 - sql.js uses a file lock so multiple Node processes can share one DB file; for heavy production load prefer PostgreSQL (`DATABASE_URL`).
-- No atomic cross-chain commit / rollback.
+- No atomic cross-chain commit / rollback: source escrow finalization and destination execution are separate on-chain transactions.
+- The local API submission route uses the deterministic Hardhat account for automation; MetaMask direct submission is available when a user needs to choose the source account.
 # Cryptographic consensus and leader rotation
 
 Approvals use the versioned canonical digest `keccak256(abi.encode(...))`:
@@ -237,7 +270,7 @@ $env:SEPOLIA_LISTENER_ADDRESSES="0xA...,0xB...,0xC...,0xD..."
 npx hardhat run scripts/deploySepoliaEscrow.ts --network sepolia
 ```
 
-3. Put the resulting address in `SEPOLIA_ESCROW_ADDRESS` for the listeners and `VITE_SEPOLIA_ESCROW_ADDRESS` in `dashboard/.env`. Set `SOURCE_MODE=sepolia`, `SEPOLIA_CHAIN_ID=11155111`, and `SEPOLIA_LISTENER_MNEMONIC` for each listener process. `LISTENER_ID=A|B|C|D` selects the derivation path; `REQUIRED_VOTES=3` and `TOTAL_LISTENERS=4` are the enforced quorum.
+3. Put the resulting address in `SEPOLIA_ESCROW_ADDRESS` for the listener/API environment. Set `SOURCE_MODE=sepolia`, `SEPOLIA_CHAIN_ID=11155111`, and `SEPOLIA_LISTENER_MNEMONIC` for each listener process. The dashboard obtains the address and verification status from `GET /api/deployment`; it does not accept a separate frontend address. `LISTENER_ID=A|B|C|D` selects the derivation path; `REQUIRED_VOTES=3` and `TOTAL_LISTENERS=4` are the enforced quorum.
 4. Restart the API and four listener processes with the Sepolia environment. The same listener/database/consensus implementation is used; local Hardhat mode remains the default.
 5. In MetaMask, switch to Sepolia, obtain faucet ETH, open the dashboard, and deposit a small amount. The UI shows the deposit hash separately from the release hash and polls `/api/transactions/:txId` for listener votes and settlement.
 

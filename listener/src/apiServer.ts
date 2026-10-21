@@ -22,7 +22,12 @@ import { ethers } from "ethers";
 import { WebSocketServer, WebSocket } from "ws";
 import { getDb, closeDb } from "./db";
 import { childLogger } from "./logger";
-import { API_PORT, API_HOST, API_CORS_ORIGINS, SOURCE_RPC_URL, EXECUTOR_MNEMONIC, SOURCE_CHAIN_ID, SOURCE_MODE, SEPOLIA_ESCROW_ADDRESS } from "./config";
+import {
+  API_PORT, API_HOST, API_CORS_ORIGINS, SOURCE_RPC_URL, EXECUTOR_MNEMONIC,
+  SOURCE_CHAIN_ID, SOURCE_MODE, SEPOLIA_ESCROW_ADDRESS, DESTINATION_TYPE,
+  SEPOLIA_RPC_URL, DEST_RPC_URL, DEST_CHAIN_ID, DESTINATION_RECEIVER_ADDRESS, REQUIRED_VOTES,
+  TOTAL_LISTENERS,
+} from "./config";
 import { TxStatus, CrossChainTransaction, TransferMode } from "./types";
 
 // ── SenderContract ABI (minimal — only sendCrossChainTransaction) ──────────────
@@ -33,10 +38,84 @@ const SENDER_ABI = [
 
 function loadDeploymentContracts(): Record<string, string> {
   const p = path.join(__dirname, "..", "config", "deployment.json");
+  let deployment: Record<string, string> = {};
   if (fs.existsSync(p)) {
-    try { return JSON.parse(fs.readFileSync(p, "utf8")).contracts ?? {}; } catch { /* fall through */ }
+    try { deployment = JSON.parse(fs.readFileSync(p, "utf8")).contracts ?? {}; } catch { /* fall through */ }
   }
-  return {};
+  return {
+    ...deployment,
+    ...(process.env.SENDER_CONTRACT_ADDRESS ? { SenderContract: process.env.SENDER_CONTRACT_ADDRESS } : {}),
+    ...(process.env.RECEIVER_MOCK_ADDRESS ? { ReceiverMock: process.env.RECEIVER_MOCK_ADDRESS } : {}),
+    ...(process.env.DESTINATION_RECEIVER_ADDRESS ? { DestinationReceiver: process.env.DESTINATION_RECEIVER_ADDRESS } : {}),
+    ...(process.env.SEPOLIA_ESCROW_ADDRESS ? { SepoliaEscrow: process.env.SEPOLIA_ESCROW_ADDRESS } : {}),
+  };
+}
+
+const SEPOLIA_ESCROW_ABI = [
+  "function requiredVotes() view returns (uint256)",
+  "function listenerCount() view returns (uint256)",
+];
+
+export function validateSepoliaEscrowMetadata(
+  address: string,
+  chainId: number,
+  bytecode: string,
+  requiredVotes: bigint,
+  listenerCount: bigint,
+): string | null {
+  if (!ethers.isAddress(address)) return "SEPOLIA_ESCROW_ADDRESS is not a valid EVM address";
+  if (chainId !== 11155111) return `Sepolia RPC returned chain ${chainId}, expected 11155111`;
+  if (bytecode === "0x") return `No contract bytecode at ${ethers.getAddress(address)} on Sepolia`;
+  if (requiredVotes !== 3n || listenerCount !== 4n) {
+    return `Escrow quorum is ${requiredVotes}-of-${listenerCount}, expected 3-of-4`;
+  }
+  return null;
+}
+
+export interface SepoliaEscrowStatus {
+  chainId: number;
+  configured: boolean;
+  verified: boolean;
+  escrowAddress: string | null;
+  error?: string;
+}
+
+export async function getSepoliaEscrowStatus(): Promise<SepoliaEscrowStatus> {
+  const chainId = 11155111;
+  if (!SEPOLIA_ESCROW_ADDRESS) {
+    return { chainId, configured: false, verified: false, escrowAddress: null, error: "SEPOLIA_ESCROW_ADDRESS is not configured" };
+  }
+  if (!ethers.isAddress(SEPOLIA_ESCROW_ADDRESS)) {
+    return { chainId, configured: true, verified: false, escrowAddress: SEPOLIA_ESCROW_ADDRESS, error: "SEPOLIA_ESCROW_ADDRESS is not a valid EVM address" };
+  }
+  if (!SEPOLIA_RPC_URL) {
+    return { chainId, configured: true, verified: false, escrowAddress: ethers.getAddress(SEPOLIA_ESCROW_ADDRESS), error: "SEPOLIA_RPC_URL is required to verify the Sepolia escrow" };
+  }
+  try {
+    const provider = new ethers.JsonRpcProvider(SEPOLIA_RPC_URL);
+    const network = await provider.getNetwork();
+    const address = ethers.getAddress(SEPOLIA_ESCROW_ADDRESS);
+    const networkChainId = Number(network.chainId);
+    const bytecode = await provider.getCode(address);
+    const escrow = new ethers.Contract(address, SEPOLIA_ESCROW_ABI, provider);
+    const [requiredVotes, listenerCount] = await Promise.all([
+      escrow.requiredVotes(),
+      escrow.listenerCount(),
+    ]);
+    const validationError = validateSepoliaEscrowMetadata(
+      address, networkChainId, bytecode, BigInt(requiredVotes), BigInt(listenerCount),
+    );
+    if (validationError) throw new Error(validationError);
+    return { chainId, configured: true, verified: true, escrowAddress: address };
+  } catch (err) {
+    return {
+      chainId,
+      configured: true,
+      verified: false,
+      escrowAddress: ethers.getAddress(SEPOLIA_ESCROW_ADDRESS),
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 const log = childLogger("apiServer");
@@ -55,7 +134,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.use(cors({
   origin: (origin, callback) => callback(null, isApiOriginAllowed(origin)),
 }));
-app.use(express.json());
+app.use(express.json({ limit: "64kb" }));
 
 // ── WebSocket clients ─────────────────────────────────────────────────────────
 
@@ -132,8 +211,74 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-app.get("/api/health", (_req: Request, res: Response) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+async function checkRuntimeHealth() {
+  const checks: Record<string, { status: "pass" | "fail"; detail: string }> = {};
+  try {
+    await getDb();
+    checks.database = { status: "pass", detail: "database is available" };
+  } catch (err) {
+    checks.database = { status: "fail", detail: err instanceof Error ? err.message : String(err) };
+  }
+
+  const sourceProvider = new ethers.JsonRpcProvider(SOURCE_RPC_URL);
+  try {
+    const network = await sourceProvider.getNetwork();
+    if (Number(network.chainId) !== SOURCE_CHAIN_ID) {
+      throw new Error(`expected chain ${SOURCE_CHAIN_ID}, got ${network.chainId}`);
+    }
+    const contracts = loadDeploymentContracts();
+    const sourceAddress = SOURCE_MODE === "sepolia" ? SEPOLIA_ESCROW_ADDRESS : contracts.SenderContract;
+    if (!sourceAddress || (await sourceProvider.getCode(sourceAddress)) === "0x") {
+      throw new Error("configured source contract has no deployed bytecode");
+    }
+    checks.sourceRpc = { status: "pass", detail: `chain ${SOURCE_CHAIN_ID}` };
+  } catch (err) {
+    checks.sourceRpc = { status: "fail", detail: err instanceof Error ? err.message : String(err) };
+  }
+
+  if (DESTINATION_TYPE === "evm") {
+    try {
+      const provider = new ethers.JsonRpcProvider(DEST_RPC_URL);
+      const network = await provider.getNetwork();
+      if (Number(network.chainId) !== DEST_CHAIN_ID) {
+        throw new Error(`expected chain ${DEST_CHAIN_ID}, got ${network.chainId}`);
+      }
+      if (!DESTINATION_RECEIVER_ADDRESS || (await provider.getCode(DESTINATION_RECEIVER_ADDRESS)) === "0x") {
+        throw new Error("configured destination receiver has no deployed bytecode");
+      }
+      checks.destinationRpc = { status: "pass", detail: `chain ${DEST_CHAIN_ID}` };
+    } catch (err) {
+      checks.destinationRpc = { status: "fail", detail: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  const failed = Object.values(checks).some((check) => check.status === "fail");
+  return { status: failed ? "fail" : "pass", checks };
+}
+
+app.get("/api/health", async (_req: Request, res: Response) => {
+  const health = await checkRuntimeHealth();
+  res.status(health.status === "pass" ? 200 : 503).json({
+    ...health,
+    status: health.status === "pass" ? "ok" : "degraded",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get("/api/ready", async (_req: Request, res: Response) => {
+  const health = await checkRuntimeHealth();
+  const heartbeats = await (await getDb()).getHeartbeats();
+  const now = Date.now();
+  const online = heartbeats.filter((heartbeat) => now - heartbeat.lastSeenAt < 30_000);
+  const listenersReady = online.length >= TOTAL_LISTENERS;
+  const ready = health.status === "pass" && listenersReady;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? "ready" : "not_ready",
+    requiredListeners: TOTAL_LISTENERS,
+    requiredVotes: REQUIRED_VOTES,
+    onlineListeners: online.map((heartbeat) => heartbeat.listenerId),
+    checks: health.checks,
+  });
 });
 
 app.get("/api/transactions", async (req: Request, res: Response) => {
@@ -375,14 +520,129 @@ app.post("/api/transactions/submit", async (req: Request, res: Response) => {
 
 // ── GET /api/deployment ───────────────────────────────────────────────────────
 
-app.get("/api/deployment", (_req: Request, res: Response) => {
+app.get("/api/deployment", async (_req: Request, res: Response) => {
   const contracts = loadDeploymentContracts();
   const hasDeployment = !!contracts.SenderContract;
+  const sepolia = await getSepoliaEscrowStatus();
   res.json({
     deployed: hasDeployment,
     contracts,
     rpcUrl: SOURCE_RPC_URL,
+    sourceChainId: SOURCE_CHAIN_ID,
+    sourceNetwork: SOURCE_MODE === "sepolia" ? "Ethereum Sepolia" : "Local Hardhat",
+    destinationChainId: DESTINATION_TYPE === "evm" ? DEST_CHAIN_ID : undefined,
+    destinationNetwork: DESTINATION_TYPE === "evm" ? "Local Hardhat destination" : DESTINATION_TYPE,
+    sepolia,
   });
+});
+
+async function getNetworkSnapshot(
+  name: string,
+  rpcUrl: string,
+  expectedChainId: number,
+  contracts: Record<string, string>,
+) {
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const accounts: Array<{
+    index: number;
+    address: string;
+    balanceWei: string;
+    balanceEth: string;
+    transactionCount: number;
+    localTestAccount: boolean;
+  }> = [];
+  try {
+    const network = await provider.getNetwork();
+    const chainId = Number(network.chainId);
+    const latestBlock = await provider.getBlockNumber();
+    const rawAccounts = await provider.send("eth_accounts", []) as string[];
+    for (const [index, address] of rawAccounts.entries()) {
+      const [balance, transactionCount] = await Promise.all([
+        provider.getBalance(address),
+        provider.getTransactionCount(address),
+      ]);
+      accounts.push({
+        index,
+        address: ethers.getAddress(address),
+        balanceWei: balance.toString(),
+        balanceEth: ethers.formatEther(balance),
+        transactionCount,
+        localTestAccount: true,
+      });
+    }
+    const deploymentAddresses = Object.entries(contracts)
+      .filter(([, address]) => typeof address === "string" && ethers.isAddress(address))
+      .map(([contract, address]) => ({ contract, address, deployed: true }));
+    return {
+      name,
+      chainId,
+      expectedChainId,
+      rpcUrl,
+      connected: chainId === expectedChainId,
+      nativeCurrency: "ETH",
+      latestBlock,
+      accounts,
+      contracts: deploymentAddresses,
+    };
+  } catch (err) {
+    return {
+      name,
+      chainId: expectedChainId,
+      expectedChainId,
+      rpcUrl,
+      connected: false,
+      nativeCurrency: "ETH",
+      latestBlock: null,
+      accounts: [],
+      contracts: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+app.get("/api/explorer", async (_req: Request, res: Response) => {
+  try {
+    const deployment = loadDeploymentContracts();
+    const [source, destination, totalTransactions, listeners, sepolia] = await Promise.all([
+      getNetworkSnapshot("Local Hardhat source", SOURCE_RPC_URL, SOURCE_CHAIN_ID, {
+        SenderContract: deployment.SenderContract,
+        ReceiverMock: deployment.ReceiverMock,
+      }),
+      DESTINATION_TYPE === "evm"
+        ? getNetworkSnapshot("Local Hardhat destination", DEST_RPC_URL, DEST_CHAIN_ID, {
+          DestinationReceiver: deployment.DestinationReceiver,
+        })
+        : Promise.resolve({
+          name: `${DESTINATION_TYPE} destination`,
+          chainId: null,
+          expectedChainId: null,
+          rpcUrl: null,
+          connected: false,
+          nativeCurrency: "ETH",
+          latestBlock: null,
+          accounts: [],
+          contracts: [],
+          error: `${DESTINATION_TYPE} destination does not expose local EVM accounts`,
+        }),
+      (await getDb()).countTransactions(),
+      (await getDb()).getHeartbeats(),
+      getSepoliaEscrowStatus(),
+    ]);
+    res.json({
+      source,
+      destination,
+      totalTrackedTransactions: totalTransactions,
+      listeners,
+      requiredVotes: REQUIRED_VOTES,
+      totalListeners: TOTAL_LISTENERS,
+      sourceMode: SOURCE_MODE,
+      destinationType: DESTINATION_TYPE,
+      sepolia,
+    });
+  } catch (err) {
+    log.error({ err }, "GET /api/explorer error");
+    res.status(500).json({ error: "Unable to read explorer state" });
+  }
 });
 
 // ── Server Bootstrap ──────────────────────────────────────────────────────────

@@ -263,6 +263,12 @@ describe("ReceiverMock", () => {
       await receiver.waitForDeployment();
     });
 
+    it("rejects a non-majority threshold at deployment", async () => {
+      const Factory = await ethers.getContractFactory("DestinationReceiver");
+      await expect(Factory.deploy([a.address, b.address], 31337, 1))
+        .to.be.revertedWithCustomError(Factory, "InvalidConfiguration");
+    });
+
     async function signatures(nonce = 4n, deadline = 9999999999n) {
       const digest = await receiver.digest(
         sourceTxId, route, ethers.keccak256(payload), ethers.ZeroAddress, 0, 0, nonce, deadline,
@@ -304,6 +310,19 @@ describe("ReceiverMock", () => {
         ethers.keccak256(ethers.toUtf8Bytes("unauthorized")), route, payload, 4, 9999999999n,
         [a.signingKey.sign(digest).serialized, unauthorized.signingKey.sign(digest).serialized],
       )).to.be.revertedWithCustomError(receiver, "UnauthorizedSigner");
+    });
+
+    it("rejects malleable high-s signatures", async () => {
+      const serialized = (await signatures())[0].slice(2);
+      const r = serialized.slice(0, 64);
+      const s = BigInt(`0x${serialized.slice(64, 128)}`);
+      const v = Number.parseInt(serialized.slice(128, 130), 16);
+      const curveOrder = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+      const highS = (curveOrder - s).toString(16).padStart(64, "0");
+      const malleable = `0x${r}${highS}${(v === 27 ? 28 : 27).toString(16).padStart(2, "0")}`;
+      await expect(receiver.execute(
+        sourceTxId, route, payload, 4, 9999999999n, [malleable, (await signatures())[1]],
+      )).to.be.revertedWithCustomError(receiver, "InvalidSignature");
     });
   });
 

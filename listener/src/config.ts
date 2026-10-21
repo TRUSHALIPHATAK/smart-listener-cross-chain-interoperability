@@ -128,11 +128,20 @@ export const DESTINATION_RECEIVER_ADDRESS: string =
 export const SEPOLIA_ESCROW_ADDRESS: string =
   process.env.SEPOLIA_ESCROW_ADDRESS ?? deployment.SepoliaEscrow ?? "";
 /** Local-demo only: Hardhat's public test mnemonic. Listener A..D use accounts #1..#4. */
-export const EXECUTOR_MNEMONIC  = optional("EXECUTOR_MNEMONIC", "test test test test test test test test test test test junk");
-export const OWNER_MNEMONIC     = optional("OWNER_MNEMONIC", "test test test test test test test test test test test junk");
+const LOCAL_DEVELOPMENT_MNEMONIC = "test test test test test test test test test test test junk";
+const isLocalHardhat = SOURCE_MODE === "hardhat" && SOURCE_CHAIN_ID === 31337;
+export const EXECUTOR_MNEMONIC  = optional("EXECUTOR_MNEMONIC", isLocalHardhat ? LOCAL_DEVELOPMENT_MNEMONIC : "");
+export const OWNER_MNEMONIC     = optional("OWNER_MNEMONIC", isLocalHardhat ? LOCAL_DEVELOPMENT_MNEMONIC : "");
 export const SEPOLIA_LISTENER_MNEMONIC = SOURCE_MODE === "sepolia"
   ? optional("SEPOLIA_LISTENER_MNEMONIC", "")
   : EXECUTOR_MNEMONIC;
+
+if (!EXECUTOR_MNEMONIC) {
+  throw new Error("EXECUTOR_MNEMONIC must be set outside the isolated local Hardhat environment");
+}
+if (!OWNER_MNEMONIC) {
+  throw new Error("OWNER_MNEMONIC must be set outside the isolated local Hardhat environment");
+}
 
 // Settlement timing:
 // c is CONFIRMATIONS (source blocks, dimensionless); lambdaB is the source

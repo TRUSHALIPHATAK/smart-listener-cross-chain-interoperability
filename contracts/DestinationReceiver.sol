@@ -34,11 +34,18 @@ contract DestinationReceiver {
     error DuplicateSigner();
     error InsufficientSignatures();
     error InvalidDestinationChain();
+    error InvalidConfiguration();
 
     constructor(address[] memory executors, uint256 sourceChain, uint256 threshold) {
+        if (executors.length == 0 || threshold == 0 || threshold > executors.length || threshold <= executors.length / 2) {
+            revert InvalidConfiguration();
+        }
         sourceChainId = sourceChain;
         requiredVotes = threshold;
-        for (uint256 i = 0; i < executors.length; i++) isExecutor[executors[i]] = true;
+        for (uint256 i = 0; i < executors.length; i++) {
+            if (executors[i] == address(0)) revert InvalidConfiguration();
+            isExecutor[executors[i]] = true;
+        }
     }
 
     function digest(
@@ -100,6 +107,10 @@ contract DestinationReceiver {
         }
         if (v < 27) v += 27;
         if (v != 27 && v != 28) return (address(0), ECDSARecoverError.InvalidSignature);
+        // Reject malleable signatures (secp256k1 half-order rule).
+        if (uint256(s) > 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0) {
+            return (address(0), ECDSARecoverError.InvalidSignature);
+        }
         address signer = ecrecover(hash, v, r, s);
         if (signer == address(0)) return (address(0), ECDSARecoverError.InvalidSignature);
         return (signer, ECDSARecoverError.NoError);
